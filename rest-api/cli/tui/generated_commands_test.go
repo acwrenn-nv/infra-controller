@@ -430,6 +430,8 @@ func TestGeneratedCommand_CancelledMutationDoesNotCallAPI(t *testing.T) {
 	assert.Zero(t, calls.Load())
 	assert.NotNil(t, cache.Get("machine"), "cancelled mutations must preserve the cache")
 	assert.Contains(t, output, "Force delete Machine machine-1?")
+	assert.Contains(t, output, "may leave an existing compute Allocation without the Machine")
+	assert.Contains(t, output, "Machines with attached Instances are rejected")
 	assert.NotContains(t, output, "INFO:")
 }
 
@@ -477,6 +479,10 @@ func TestGeneratedCommand_MachineDeleteOffersForceMode(t *testing.T) {
 			})
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantForcePrompt, strings.Contains(output, "Force delete Machine machine-1?"))
+			if tc.wantForcePrompt {
+				assert.Contains(t, output, "may leave an existing compute Allocation without the Machine")
+				assert.Contains(t, output, "Machines with attached Instances are rejected")
+			}
 			if tc.cancel {
 				assert.Zero(t, calls.Load())
 				assert.NotNil(t, cache.Get("machine"), "cancelled mutations must preserve the cache")

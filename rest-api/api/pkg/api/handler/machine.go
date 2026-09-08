@@ -1823,6 +1823,7 @@ func (dmh DeleteMachineHandler) Handle(c echo.Context) error {
 	if err != nil {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid force query parameter, expected a boolean value", nil)
 	}
+	allowDeleteWithInstanceType := force != nil && *force
 
 	err = cdb.WithTx(ctx, dmh.dbSession, func(tx *cdb.Tx) error {
 		mDAO := cdbm.NewMachineDAO(dmh.dbSession)
@@ -1868,7 +1869,7 @@ func (dmh DeleteMachineHandler) Handle(c echo.Context) error {
 			logger.Error().Msg("no Site relation found for Machine")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Site detail for Machine", nil)
 		}
-		if force != nil && *force {
+		if allowDeleteWithInstanceType {
 			if machine.Site.Status != cdbm.SiteStatusRegistered {
 				return cutil.NewAPIError(http.StatusBadRequest, "Site specified in request data is not in Registered state, cannot execute admin operation", nil)
 			}
@@ -1897,8 +1898,9 @@ func (dmh DeleteMachineHandler) Handle(c echo.Context) error {
 				HostQuery:                   machine.ControllerMachineID,
 				DeleteInterfaces:            true,
 				DeleteBmcInterfaces:         true,
-				AllowDeleteWithInstanceType: true,
-				AllowDeleteWithInstance:     false,
+				AllowDeleteWithInstanceType: allowDeleteWithInstanceType,
+				// REST force deletion never authorizes deleting a tenant-owned Instance.
+				AllowDeleteWithInstance: false,
 			}, nil, machine.Site.ID.String())
 			if apiErr != nil && apiErr.Code != http.StatusNotFound {
 				logAPIError(logger, apiErr, "Failed to force delete Machine via Core gRPC proxy")

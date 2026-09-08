@@ -10060,7 +10060,7 @@ paths:
             default: false
           in: query
           name: force
-          description: Force deletion through NICo Core, overriding the assigned Instance Type restriction and deleting the Machine's host, DPU, and BMC interfaces. A Machine attached to an Instance cannot be force deleted.
+          description: Set to `true` to acknowledge forced deletion through NICo Core. This removes the assigned Instance Type association, which may leave an existing compute Allocation without the Machine, and deletes the Machine's host, DPU, and BMC interfaces. This does not authorize deletion of a tenant-owned Instance; a Machine with an attached Instance is rejected.
       responses:
         '202':
           description: Deletion request was accepted
@@ -10105,7 +10105,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/NICoAPIError'
-      description: Org must have an Infrastructure Provider entity. Machine must belong to the Provider. User must have authorization role with `PROVIDER_ADMIN` suffix. Without `force=true`, the Machine must have been missing from the Site for at least 24 hours and have no attached Instance or assigned Instance Type. With `force=true`, the Machine can remain assigned to an Instance Type, but it cannot have an attached Instance. NICo Core deletes the Machine and its host, DPU, and BMC interfaces, and the REST API removes the corresponding local records.
+      description: Org must have an Infrastructure Provider entity. Machine must belong to the Provider. User must have authorization role with `PROVIDER_ADMIN` suffix. Without `force=true`, the Machine must have been missing from the Site for at least 24 hours and have no attached Instance or assigned Instance Type. Setting `force=true` acknowledges that the assigned Instance Type association is removed and an existing compute Allocation may be left without the Machine. It does not authorize deletion of a tenant-owned Instance; a Machine with an attached Instance is rejected. NICo Core deletes the Machine and its host, DPU, and BMC interfaces, and the REST API removes the corresponding local records.
   '/v2/org/{org}/nico/machine/{machineId}/bmc/reset':
     parameters:
       - schema:

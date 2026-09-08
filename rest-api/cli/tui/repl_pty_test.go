@@ -336,6 +336,7 @@ func TestCLIRegression_RealTerminalAndNonInteractive(t *testing.T) {
 		terminal.send(t, "y\r")
 		terminal.waitFor(t, "Deletion request was accepted")
 		machineDeleteTranscript := terminal.transcript()[machineDeleteStart:]
+		assert.Contains(t, machineDeleteTranscript, "may leave an existing compute Allocation without the Machine")
 		assert.Contains(t, machineDeleteTranscript, "Machines with attached Instances are rejected")
 
 		// Flags preceding a generated path argument must not disable

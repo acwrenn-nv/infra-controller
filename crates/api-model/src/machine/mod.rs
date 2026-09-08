@@ -1778,6 +1778,11 @@ impl NextStateBFBSupport<DpuDiscoveringState> for DpuDiscoveringState {
         let is_dpf_based_provisioning_possible =
             dpf_based_dpu_provisioning_possible(state, dpf_enabled_at_site, false);
 
+        // Secure boot will be handled by DPF itself.
+        if is_dpf_based_provisioning_possible {
+            return DpuDiscoveringState::RebootAllDPUS;
+        }
+
         if !is_dpf_based_provisioning_possible
             && enable_secure_boot
             && bfb_install_support(&state.dpu_snapshots)
@@ -4128,12 +4133,7 @@ mod tests {
                         enable_secure_boot: true,
                     },
                     expect: (
-                        DpuDiscoveringState::DisableSecureBoot {
-                            count: 0,
-                            disable_secure_boot_state: Some(
-                                SetSecureBootState::CheckSecureBootStatus,
-                            ),
-                        },
+                        DpuDiscoveringState::RebootAllDPUS,
                         ReprovisionState::DpfStates {
                             substate: DpfState::Reprovisioning,
                         },
@@ -4207,12 +4207,7 @@ mod tests {
                         enable_secure_boot: true,
                     },
                     expect: (
-                        DpuDiscoveringState::DisableSecureBoot {
-                            count: 0,
-                            disable_secure_boot_state: Some(
-                                SetSecureBootState::CheckSecureBootStatus,
-                            ),
-                        },
+                        DpuDiscoveringState::RebootAllDPUS,
                         ReprovisionState::InstallDpuOs {
                             substate: InstallDpuOsState::InstallingBFB,
                         },

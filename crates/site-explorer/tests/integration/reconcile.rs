@@ -16,6 +16,7 @@
  */
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use carbide_site_explorer::config::SiteExplorerConfig;
 use carbide_test_harness::prelude::*;
@@ -23,6 +24,7 @@ use carbide_test_harness::test_support::network_segment::create_static_assignmen
 use mac_address::MacAddress;
 use model::expected_machine::{ExpectedMachine, ExpectedMachineData};
 use model::metadata::Metadata;
+use model::site_explorer::EndpointExplorationReport;
 
 async fn init(pool: &PgPool) -> TestHarness {
     let test_harness = TestHarness::builder(pool.clone()).build().await;
@@ -97,7 +99,7 @@ async fn test_site_explorer_reconcile_preallocates_host_nic_fixed_ip(
     let fixed_ip = "10.99.0.20";
     let parsed_fixed_ip: IpAddr = fixed_ip.parse().unwrap();
     let expected_interface = model::expected_machine::ExpectedInterface {
-        mac_address: nic_mac,
+        mac_address: Some(nic_mac),
         nic_type: Some("onboard".into()),
         fixed_ip: Some(parsed_fixed_ip),
         ..Default::default()
@@ -228,17 +230,17 @@ async fn test_site_explorer_reconcile_tolerates_per_entry_conflicts(
 
 /// Site-explorer's reconciliation pass must materialize the (nvos_mac, nvos_ip_address)
 /// pairing for expected switches, mirroring how it handles `bmc_ip_address` and the
-/// host-NIC `fixed_ip` paths. Calls `try_preallocate_one` directly the same way the
-/// expected_switches loop does, and verifies the resulting row carries the configured
-/// IP with `InterfaceType::Data`.
+/// host-NIC `fixed_ip` paths. A full iteration must scan the switch BMC but not its
+/// preallocated NVOS endpoint, while preserving the NVOS row as `InterfaceType::Data`.
 #[sqlx_test]
 async fn test_site_explorer_reconcile_preallocates_nvos_ip(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    init(&pool).await;
+    let test_harness = init(&pool).await;
 
     let bmc_mac: MacAddress = "AA:BB:CC:DD:E4:01".parse().unwrap();
     let nvos_mac: MacAddress = "AA:BB:CC:DD:E4:02".parse().unwrap();
+    let bmc_ip: IpAddr = "10.99.0.49".parse().unwrap();
     let nvos_ip: IpAddr = "10.99.0.50".parse().unwrap();
 
     let mut txn = pool.begin().await?;
@@ -247,13 +249,16 @@ async fn test_site_explorer_reconcile_preallocates_nvos_ip(
         model::expected_switch::ExpectedSwitch {
             expected_switch_id: None,
             bmc_mac_address: bmc_mac,
-            nvos_mac_addresses: vec![nvos_mac],
+            nvos_interfaces: vec![model::expected_switch::ExpectedNvosInterface {
+                mac_address: nvos_mac,
+                is_primary: true,
+            }],
             bmc_username: "ADMIN".into(),
             serial_number: "reconcile-nvos-001".into(),
             bmc_password: "PASS".into(),
             nvos_username: None,
             nvos_password: None,
-            bmc_ip_address: None,
+            bmc_ip_address: Some(bmc_ip),
             nvos_ip_address: Some(nvos_ip),
             metadata: Metadata::default(),
             rack_id: None,
@@ -272,15 +277,30 @@ async fn test_site_explorer_reconcile_preallocates_nvos_ip(
     );
     txn.commit().await?;
 
-    carbide_site_explorer::try_preallocate_one(
-        &pool,
-        nvos_mac,
-        nvos_ip,
-        model::machine_interface::InterfaceType::Data,
-        "expected_switch NVOS",
-        None,
-    )
-    .await;
+    let explorer = super::env::test_site_explorer(
+        &test_harness,
+        SiteExplorerConfig {
+            create_machines: Arc::new(false.into()),
+            create_power_shelves: Arc::new(false.into()),
+            create_switches: Arc::new(false.into()),
+            ..Default::default()
+        },
+    );
+    explorer.insert_endpoints(vec![(bmc_ip, EndpointExplorationReport::default())]);
+    explorer.run_single_iteration().await?;
+
+    assert_eq!(
+        explorer
+            .endpoint_explorer()
+            .explore_endpoint_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.ip_address)
+            .collect::<Vec<_>>(),
+        vec![bmc_ip],
+        "site explorer must scan the switch BMC without probing its NVOS endpoint",
+    );
 
     let mut txn = pool.begin().await?;
     let after = db::machine_interface::find_by_mac_address(&mut *txn, nvos_mac).await?;

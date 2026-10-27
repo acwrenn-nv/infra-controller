@@ -23,10 +23,10 @@ use model::tenant::{
     ClientSecretBasic, IdentityConfig, IdentityConfigValidationBounds,
     IdentityConfigValidationError, PublicKey, Tenant, TenantIdentityConfigDecrypted, TenantKeyset,
     TenantKeysetContent, TenantKeysetId, TenantKeysetIdentifier, TenantKeysetSearchFilter,
-    TenantPublicKey, TenantPublicKeyValidationRequest, TenantSearchFilter, TokenDelegation,
-    TokenDelegationAuthMethod, TokenDelegationAuthMethodConfig, TokenDelegationValidationBounds,
-    TokenDelegationValidationError, UpdateTenantKeyset, compute_client_secret_hash,
-    truncate_hash_for_display,
+    TenantNicFirmwareConfig, TenantPublicKey, TenantPublicKeyValidationRequest, TenantSearchFilter,
+    TokenDelegation, TokenDelegationAuthMethod, TokenDelegationAuthMethodConfig,
+    TokenDelegationValidationBounds, TokenDelegationValidationError, UpdateTenantKeyset,
+    compute_client_secret_hash, truncate_hash_for_display,
 };
 
 use crate as rpc;
@@ -62,6 +62,16 @@ impl TryFrom<Tenant> for rpc::forge::Tenant {
     }
 }
 
+impl From<TenantNicFirmwareConfig> for rpc::forge::TenantNicFirmwareConfig {
+    fn from(config: TenantNicFirmwareConfig) -> Self {
+        Self {
+            tenant_organization_id: config.organization_id.to_string(),
+            profile_id: config.profile_id.map(|id| id.to_string()),
+            config_version: config.version.version_string(),
+        }
+    }
+}
+
 impl TryFrom<Tenant> for rpc::forge::CreateTenantResponse {
     type Error = RpcDataConversionError;
 
@@ -78,6 +88,7 @@ impl TryFrom<Tenant> for rpc::forge::FindTenantResponse {
     fn try_from(value: Tenant) -> Result<Self, Self::Error> {
         Ok(rpc::forge::FindTenantResponse {
             tenant: Some(value.try_into()?),
+            permitted_routing_profile_types: vec![],
         })
     }
 }

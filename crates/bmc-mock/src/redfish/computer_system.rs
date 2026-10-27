@@ -25,15 +25,13 @@ use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
+use nv_redfish::schema::resource::PowerState;
 use serde_json::json;
 
 use crate::bmc_state::BmcState;
-use crate::json::{JsonExt, JsonPatch, json_patch};
-use crate::redfish::Builder;
-use crate::{
-    BootOptionKind, Callbacks, LogServices, MachineRouterOptions, MockPowerState,
-    POWER_CYCLE_DELAY, SetSystemPowerError, http, redfish,
-};
+use crate::json::{JsonExt, json_patch};
+use crate::redfish::ModelExt;
+use crate::{ActionError, BootOptionKind, Callbacks, MachineRouterOptions, http, redfish};
 
 pub(super) fn collection() -> redfish::Collection<'static> {
     redfish::Collection {
@@ -47,7 +45,7 @@ pub(super) fn resource<'a>(system_id: &'a str) -> redfish::Resource<'a> {
     let odata_id = format!("/redfish/v1/Systems/{system_id}");
     redfish::Resource {
         odata_id: Cow::Owned(odata_id),
-        odata_type: Cow::Borrowed("#ComputerSystem.v1_20_1.ComputerSystem"),
+        odata_type: Cow::Borrowed(redfish::schema::computer_system::ComputerSystem::ODATA_TYPE),
         id: Cow::Borrowed(system_id),
         name: Cow::Borrowed("System"),
     }
@@ -66,7 +64,9 @@ fn hpe_boot_resource(system_id: &str) -> redfish::Resource<'static> {
         odata_id: Cow::Owned(format!(
             "/redfish/v1/Systems/{system_id}/Bios/oem/hpe/boot/"
         )),
-        odata_type: Cow::Borrowed("#HpeServerBootSettings.v2_0_0.HpeServerBootSettings"),
+        odata_type: Cow::Borrowed(
+            redfish::schema::hpe_server_boot_settings::HpeServerBootSettings::ODATA_TYPE,
+        ),
         id: Cow::Borrowed("boot"),
         name: Cow::Borrowed("Boot Settings"),
     }
@@ -79,10 +79,10 @@ struct HpeBootSettingsPatch {
     persistent_boot_config_order: Vec<String>,
 }
 
-pub(crate) fn add_routes(
-    r: Router<BmcState>,
+pub(crate) fn add_routes<C: Callbacks + 'static>(
+    r: Router<BmcState<C>>,
     bmc_vendor: redfish::oem::BmcVendor,
-) -> Router<BmcState> {
+) -> Router<BmcState<C>> {
     const SYSTEM_ID: &str = "{system_id}";
     const ETH_ID: &str = "{eth_id}";
     const BOOT_OPTION_ID: &str = "{boot_option_id}";
@@ -92,53 +92,60 @@ pub(crate) fn add_routes(
     const MEMORY_ID: &str = "{memory_id}";
     let bios = redfish::bios::resource(SYSTEM_ID);
     let routes = r
-        .route(&collection().odata_id, get(get_system_collection))
+        .route(&collection().odata_id, get(get_system_collection::<C>))
         .route(
             &resource(SYSTEM_ID).odata_id,
-            get(get_system).patch(patch_system),
+            get(get_system::<C>).patch(patch_system::<C>),
         )
-        .route(&reset_target(SYSTEM_ID), post(post_reset_system))
+        .route(&reset_target(SYSTEM_ID), post(post_reset_system::<C>))
         .route(
             &bmc_vendor.make_settings_odata_id(&resource(SYSTEM_ID)),
-            patch(patch_settings),
+            patch(patch_settings::<C>),
         )
         .route(
             &redfish::ethernet_interface::system_resource(SYSTEM_ID, ETH_ID).odata_id,
-            get(get_ethernet_interface),
+            get(get_ethernet_interface::<C>),
         )
         .route(
             &redfish::ethernet_interface::system_collection(SYSTEM_ID).odata_id,
-            get(get_ethernet_interface_collection),
+            get(get_ethernet_interface_collection::<C>),
         )
         .route(
             &redfish::secure_boot::resource(SYSTEM_ID).odata_id,
-            get(get_secure_boot).patch(patch_secure_boot),
+            get(get_secure_boot::<C>).patch(patch_secure_boot::<C>),
         )
         .route(
             &redfish::boot_option::collection(SYSTEM_ID).odata_id,
-            get(get_boot_options_collection),
+            get(get_boot_options_collection::<C>),
         )
         .route(
             &redfish::boot_option::resource(SYSTEM_ID, BOOT_OPTION_ID).odata_id,
-            get(get_boot_option),
+            get(get_boot_option::<C>),
         )
         .route(
             &bmc_vendor
                 .make_settings_odata_id(&redfish::boot_option::resource(SYSTEM_ID, BOOT_OPTION_ID)),
-            patch(patch_boot_option_settings),
+            patch(patch_boot_option_settings::<C>),
         )
-        .route(&bios.odata_id, get(get_bios).patch(patch_bios_settings))
+        .route(
+            &bios.odata_id,
+            get(get_bios::<C>).patch(patch_bios_settings::<C>),
+        )
         .route(
             &redfish::log_service::system_collection(SYSTEM_ID).odata_id,
-            get(get_log_services_collection),
+            get(get_log_services_collection::<C>),
         )
         .route(
             &redfish::log_service::system_resource(SYSTEM_ID, LOG_SERVICE_ID).odata_id,
-            get(get_log_service),
+            get(get_log_service::<C>),
+        )
+        .route(
+            &redfish::log_service::system_clear_log_target(SYSTEM_ID, LOG_SERVICE_ID),
+            post(post_clear_log::<C>),
         )
         .route(
             &redfish::log_service::system_entries_collection(SYSTEM_ID, LOG_SERVICE_ID).odata_id,
-            get(get_log_service_entries),
+            get(get_log_service_entries::<C>),
         )
         .route(
             &format!(
@@ -146,39 +153,39 @@ pub(crate) fn add_routes(
                 redfish::log_service::system_entries_collection(SYSTEM_ID, LOG_SERVICE_ID).odata_id,
                 LOG_ENTRY_ID
             ),
-            get(get_log_service_entry),
+            get(get_log_service_entry::<C>),
         )
         .route(
             &redfish::storage::system_collection(SYSTEM_ID).odata_id,
-            get(get_storage_collection),
+            get(get_storage_collection::<C>),
         )
         .route(
             &redfish::processor::system_collection(SYSTEM_ID).odata_id,
-            get(get_processors_collection),
+            get(get_processors_collection::<C>),
         )
         .route(
             &redfish::processor::system_resource(SYSTEM_ID, PROCESSOR_ID).odata_id,
-            get(get_processor),
+            get(get_processor::<C>),
         )
         .route(
             &redfish::processor::metrics_resource(SYSTEM_ID, PROCESSOR_ID).odata_id,
-            get(get_processor_metrics),
+            get(get_processor_metrics::<C>),
         )
         .route(
             &redfish::memory::system_collection(SYSTEM_ID).odata_id,
-            get(get_memory_collection),
+            get(get_memory_collection::<C>),
         )
         .route(
             &redfish::memory::system_resource(SYSTEM_ID, MEMORY_ID).odata_id,
-            get(get_memory),
+            get(get_memory::<C>),
         )
         .route(
             &redfish::memory::metrics_resource(SYSTEM_ID, MEMORY_ID).odata_id,
-            get(get_memory_metrics),
+            get(get_memory_metrics::<C>),
         )
         .route(
             &bmc_vendor.make_settings_odata_id(&bios),
-            patch(patch_bios_settings),
+            patch(patch_bios_settings::<C>),
         )
         .route(
             &redfish::bios::change_password_target(&bios),
@@ -190,28 +197,29 @@ pub(crate) fn add_routes(
         // routing them, while the Redfish resource still advertises canonical
         // trailing-slash OData identifiers.
         let hpe_boot_path = hpe_boot.odata_id.trim_end_matches('/');
-        routes.route(hpe_boot_path, get(get_hpe_boot)).route(
+        routes.route(hpe_boot_path, get(get_hpe_boot::<C>)).route(
             &format!("{hpe_boot_path}/settings"),
-            patch(patch_hpe_boot_settings),
+            patch(patch_hpe_boot_settings::<C>),
         )
     } else {
         routes
     }
 }
 
-pub(crate) struct SingleSystemConfig {
+pub(crate) struct SingleSystemConfig<C: Callbacks> {
     pub(crate) id: Cow<'static, str>,
     pub(crate) eth_interfaces: Option<Vec<redfish::ethernet_interface::EthernetInterface>>,
     pub(crate) serial_number: Option<Cow<'static, str>>,
     pub(crate) manufacturer: Option<Cow<'static, str>>,
     pub(crate) model: Option<Cow<'static, str>>,
+    pub(crate) bios_version: Option<Cow<'static, str>>,
     pub(crate) boot_order_mode: BootOrderMode,
-    pub(crate) callbacks: Option<Arc<dyn Callbacks>>,
+    pub(crate) callbacks: Option<Arc<C>>,
     pub(crate) chassis: Vec<Cow<'static, str>>,
     pub(crate) boot_options: Option<Vec<redfish::boot_option::BootOption>>,
     pub(crate) bios_mode: BiosMode,
     pub(crate) base_bios: Option<serde_json::Value>,
-    pub(crate) log_services: Option<Arc<dyn LogServices>>,
+    pub(crate) log_services: Option<redfish::log_service::LogServices>,
     pub(crate) storage: Option<Vec<redfish::storage::Storage>>,
     pub(crate) processors: Option<Vec<redfish::processor::Processor>>,
     pub(crate) memory: Option<Vec<redfish::memory::Memory>>,
@@ -220,23 +228,24 @@ pub(crate) struct SingleSystemConfig {
     pub(crate) oem: Oem,
 }
 
-pub(crate) struct Config {
-    pub(crate) systems: Vec<SingleSystemConfig>,
+pub(crate) struct Config<C: Callbacks> {
+    pub(crate) systems: Vec<SingleSystemConfig<C>>,
 }
 
-pub struct SystemState {
-    systems: Vec<SingleSystemState>,
+pub struct SystemState<C: Callbacks> {
+    systems: Vec<SingleSystemState<C>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BootSourceOverride {
     mode: Option<String>,
     enabled: Option<String>,
     target: Option<String>,
 }
 
-pub(crate) struct SingleSystemState {
-    config: SingleSystemConfig,
+pub(crate) struct SingleSystemState<C: Callbacks> {
+    config: SingleSystemConfig<C>,
+    power_state: Mutex<Option<PowerState>>,
     serial_console_ssh_port_override: Mutex<Option<u16>>,
     virtual_media: Option<redfish::virtual_media::VirtualMediaState>,
     boot_order_override: Mutex<Option<Vec<String>>>,
@@ -247,6 +256,16 @@ pub(crate) struct SingleSystemState {
     boot_source_override: Mutex<BootSourceOverride>,
     secure_boot_enabled: Arc<AtomicBool>,
     bios_overrides: Arc<Mutex<serde_json::Value>>,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedSystemState {
+    bios_overrides: serde_json::Value,
+    boot_order: Option<Vec<String>>,
+    hpe_boot_order: Option<Vec<String>>,
+    boot_options: HashMap<String, serde_json::Value>,
+    boot_source: BootSourceOverride,
+    secure_boot_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,23 +287,142 @@ pub(crate) enum Oem {
     Generic,
 }
 
-impl SystemState {
-    pub(crate) fn from_config(config: Config, options: &MachineRouterOptions) -> Self {
+impl<C: Callbacks> SystemState<C> {
+    pub(crate) fn persisted(&self) -> std::collections::BTreeMap<String, PersistedSystemState> {
+        self.systems
+            .iter()
+            .map(|system| {
+                // Boot resolution takes these locks in a different order. Release
+                // each guard before reading the next field.
+                let bios_overrides = system
+                    .bios_overrides
+                    .lock()
+                    .expect("mutex poisoned")
+                    .clone();
+                let boot_order = system
+                    .boot_order_override
+                    .lock()
+                    .expect("mutex poisoned")
+                    .clone();
+                let hpe_boot_order = system
+                    .hpe_boot_order_override
+                    .lock()
+                    .expect("mutex poisoned")
+                    .clone();
+                let boot_options = system
+                    .boot_option_overrides
+                    .lock()
+                    .expect("mutex poisoned")
+                    .clone();
+                let boot_source = system
+                    .boot_source_override
+                    .lock()
+                    .expect("mutex poisoned")
+                    .clone();
+                (
+                    system.config.id.to_string(),
+                    PersistedSystemState {
+                        bios_overrides,
+                        boot_order,
+                        hpe_boot_order,
+                        boot_options,
+                        boot_source,
+                        secure_boot_enabled: system.secure_boot_enabled.load(Ordering::SeqCst),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn validate_persisted(
+        &self,
+        saved: &std::collections::BTreeMap<String, PersistedSystemState>,
+    ) -> bool {
+        saved.len() == self.systems.len()
+            && saved
+                .iter()
+                .all(|(id, state)| self.find(id).is_some() && state.bios_overrides.is_object())
+    }
+
+    pub(crate) fn restore_persisted(
+        &self,
+        saved: &std::collections::BTreeMap<String, PersistedSystemState>,
+    ) {
+        for (id, state) in saved {
+            let system = self.find(id).expect("validated system identity");
+            *system.bios_overrides.lock().expect("mutex poisoned") = state.bios_overrides.clone();
+            *system.boot_order_override.lock().expect("mutex poisoned") = state.boot_order.clone();
+            *system
+                .hpe_boot_order_override
+                .lock()
+                .expect("mutex poisoned") = state.hpe_boot_order.clone();
+            *system.boot_option_overrides.lock().expect("mutex poisoned") =
+                state.boot_options.clone();
+            *system.boot_source_override.lock().expect("mutex poisoned") =
+                state.boot_source.clone();
+            system
+                .secure_boot_enabled
+                .store(state.secure_boot_enabled, Ordering::SeqCst);
+        }
+    }
+
+    /// Updates the power observation exposed for the controlled system.
+    /// `PowerState` is omitted from Redfish responses until an observation is published.
+    /// Unrecognized observations (`UnsupportedValue`) are reported as JSON null.
+    /// Returns false when this BMC has no controlled system.
+    pub fn set_power_state(&self, power_state: PowerState) -> bool {
+        let Some(system) = self.controlled_system() else {
+            return false;
+        };
+        *system
+            .power_state
+            .lock()
+            .expect("power state lock poisoned") = Some(power_state);
+        true
+    }
+
+    pub(crate) fn from_config(config: Config<C>, options: &MachineRouterOptions) -> Self {
         Self::from_configs(config.systems, options.virtual_media_devices.clone())
     }
 
-    pub(crate) fn systems(&self) -> &[SingleSystemState] {
+    pub(crate) fn systems(&self) -> &[SingleSystemState<C>] {
         &self.systems
     }
 
-    pub(crate) fn find(&self, system_id: &str) -> Option<&SingleSystemState> {
+    pub(crate) fn find(&self, system_id: &str) -> Option<&SingleSystemState<C>> {
         self.systems
             .iter()
             .find(|system| system.config.id.as_ref() == system_id)
     }
 
+    /// `@odata.id` of the controllable host system: the one wired to power
+    /// callbacks, else the first system.
+    pub(crate) fn primary_system_odata_id(&self) -> Option<String> {
+        self.systems
+            .iter()
+            .find(|system| system.config.callbacks.is_some())
+            .or(self.systems.first())
+            .map(|system| resource(&system.config.id).odata_id.into_owned())
+    }
+
+    /// Append a lifecycle entry to the first system event log. Returns the new
+    /// LogEntry's `@odata.id`, or `None` when no system has a log service.
+    pub(crate) fn record_log(
+        &self,
+        draft: redfish::log_service::LogEntryDraft,
+        created: &str,
+    ) -> Option<String> {
+        self.systems.iter().find_map(|system| {
+            let log = system.config.log_services.as_ref()?.primary()?;
+            let id = log.append(draft.clone(), created);
+            let collection =
+                redfish::log_service::system_entries_collection(&system.config.id, log.id());
+            Some(format!("{}/{id}", collection.odata_id))
+        })
+    }
+
     fn from_configs(
-        configs: Vec<SingleSystemConfig>,
+        configs: Vec<SingleSystemConfig<C>>,
         virtual_media_devices: Option<Vec<redfish::virtual_media::DeviceConfig>>,
     ) -> Self {
         let mut virtual_media =
@@ -303,7 +441,7 @@ impl SystemState {
         Self { systems }
     }
 
-    pub(crate) fn controlled_system(&self) -> Option<&SingleSystemState> {
+    pub(crate) fn controlled_system(&self) -> Option<&SingleSystemState<C>> {
         self.systems
             .iter()
             .find(|system| system.config.callbacks.is_some())
@@ -364,13 +502,14 @@ impl SystemState {
     }
 }
 
-impl SingleSystemState {
+impl<C: Callbacks> SingleSystemState<C> {
     fn new(
-        config: SingleSystemConfig,
+        config: SingleSystemConfig<C>,
         virtual_media: Option<redfish::virtual_media::VirtualMediaState>,
     ) -> Self {
         Self {
             config,
+            power_state: Mutex::new(None),
             virtual_media,
             serial_console_ssh_port_override: Mutex::new(None),
             boot_order_override: Mutex::new(None),
@@ -529,6 +668,55 @@ impl SingleSystemState {
         }
     }
 
+    /// Resolve the first configured HPE OEM boot entry, then standard
+    /// BootOrder, then the profile default. Unknown or unconfigured HPE entries
+    /// are skipped. Returns None when no boot option is configured; callers
+    /// leave domain configuration unchanged in that case. Temporary overrides
+    /// are excluded.
+    pub(crate) fn resolve_persistent_boot_selection(&self) -> Option<BootOptionKind> {
+        self.hpe_boot_order_override
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|order| {
+                order.iter().find_map(|entry| {
+                    let (kind, reference) = entry
+                        .strip_prefix("HD.BootOption.")
+                        .map(|reference| (BootOptionKind::Disk, reference))
+                        .or_else(|| {
+                            entry
+                                .strip_prefix("NIC.BootOption.")
+                                .map(|reference| (BootOptionKind::Network, reference))
+                        })?;
+                    self.config
+                        .boot_options
+                        .iter()
+                        .flatten()
+                        .find(|option| option.kind == kind && option.boot_reference() == reference)
+                        .map(|option| option.kind)
+                })
+            })
+            .or_else(|| {
+                self.boot_order_override().and_then(|overrides| {
+                    overrides.first().and_then(|optref| {
+                        self.config
+                            .boot_options
+                            .iter()
+                            .flatten()
+                            .find(|v| v.boot_reference() == optref)
+                            .map(|opt| opt.kind)
+                    })
+                })
+            })
+            .or_else(|| {
+                self.config
+                    .boot_options
+                    .as_ref()?
+                    .first()
+                    .map(|opt| opt.kind)
+            })
+    }
+
     fn resolve_current_boot_selection(&self) -> Option<BootOptionKind> {
         let src = self.boot_source_override.lock().unwrap();
         if src.enabled.as_ref().is_some_and(|v| v != "Disabled")
@@ -550,29 +738,11 @@ impl SingleSystemState {
         } else {
             None
         }
-        .or_else(|| {
-            self.boot_order_override().and_then(|overrides| {
-                overrides.first().and_then(|optref| {
-                    self.config
-                        .boot_options
-                        .iter()
-                        .flatten()
-                        .find(|v| v.boot_reference() == optref)
-                        .map(|opt| opt.kind)
-                })
-            })
-        })
-        .or_else(|| {
-            self.config
-                .boot_options
-                .as_ref()?
-                .first()
-                .map(|opt| opt.kind)
-        })
+        .or_else(|| self.resolve_persistent_boot_selection())
     }
 }
 
-async fn get_system_collection(State(state): State<BmcState>) -> Response {
+async fn get_system_collection<C: Callbacks>(State(state): State<BmcState<C>>) -> Response {
     // Delta power shelves serve no `Systems` collection at all (the endpoint
     // 404s), which is the condition site-explorer's Delta path handles.
     if !state.exposes_computer_systems {
@@ -587,135 +757,157 @@ async fn get_system_collection(State(state): State<BmcState>) -> Response {
     collection().with_members(&members).into_ok_response()
 }
 
-async fn get_system(State(state): State<BmcState>, Path(system_id): Path<String>) -> Response {
+async fn get_system<C: Callbacks>(
+    State(state): State<BmcState<C>>,
+    Path(system_id): Path<String>,
+) -> Response {
+    use super::schema::computer_system::{Boot, ComputerSystem, Links};
+    use super::schema::resource::PowerState as ResponsePowerState;
     let Some(system_state) = state.system_state.find(&system_id) else {
         return http::not_found();
     };
-
-    let mut b = builder(&resource(&system_id)).link_chassis(&system_state.config.chassis);
-
     let config = &system_state.config;
-
-    if let Some(state) = config
-        .callbacks
-        .as_ref()
-        .map(|callbacks| callbacks.get_power_state())
-    {
-        b = b.power_state(state)
-    }
-
-    if config.boot_options.is_some() {
-        if let Some(boot_order) = system_state.boot_order_override() {
-            b = b.boot_order(&boot_order.iter().map(String::as_str).collect::<Vec<_>>());
-        } else {
-            b = b.boot_order(
-                &config
-                    .boot_options
-                    .iter()
-                    .flatten()
-                    .map(|v| v.boot_reference())
-                    .collect::<Vec<_>>(),
-            );
-        }
-    }
-
-    let boot_source_override = system_state.boot_source_override();
-    if boot_source_override
-        .as_object()
-        .is_some_and(|value| !value.is_empty())
-    {
-        b = b.boot_source_override(boot_source_override);
-    }
-
-    if system_state.virtual_media().is_some() {
-        b = b.virtual_media(&redfish::virtual_media::collection(&system_id));
-    }
-
-    b = match config.oem {
-        Oem::Generic => b,
-        Oem::NvidiaBluefield => {
-            b.oem_nvidia(&redfish::oem::nvidia::bluefield::resource(&system_id))
-        }
-    };
-
-    let simulated_ssh_port = *system_state
-        .serial_console_ssh_port_override
+    let resource = resource(&system_id);
+    let power_state = *system_state
+        .power_state
         .lock()
-        .expect("mutex poisoned");
-    let serial_console = match (&config.serial_console, simulated_ssh_port) {
-        (Some(serial_console), Some(port)) => Some(serial_console.with_ssh_port(port)),
-        (Some(serial_console), None) => Some(serial_console.clone()),
-        (None, Some(port)) => Some(redfish::serial_console::simulated_ssh(port)),
-        (None, None) => None,
-    };
-    if let Some(serial_console) = serial_console {
-        b = b.serial_console(&serial_console);
-    }
-
+        .expect("power state lock poisoned");
+    let boot = config.boot_options.as_ref().map(|options| {
+        let order = system_state.boot_order_override().unwrap_or_else(|| {
+            options
+                .iter()
+                .map(|v| v.boot_reference().to_string())
+                .collect()
+        });
+        Boot::new().boot_order(order).boot_options(
+            redfish::boot_option::collection(&system_id)
+                .odata_id
+                .as_ref(),
+        )
+    });
     let pcie_devices = config
         .chassis
         .iter()
-        .flat_map(|chassis_id| state.chassis_state.find(chassis_id))
-        .flat_map(|chassis| chassis.pcie_devices_resources().into_iter())
+        .flat_map(|id| state.chassis_state.find(id))
+        .flat_map(|chassis| chassis.pcie_devices_resources())
+        .map(|v| v.odata_id.into_owned())
         .collect::<Vec<_>>();
-
-    let bios = config
-        .base_bios
-        .is_some()
-        .then_some(redfish::bios::resource(&system_id));
-
-    let boot_options = config
-        .boot_options
-        .is_some()
-        .then_some(redfish::boot_option::collection(&system_id));
-
-    let ethernet_interfaces = config
-        .eth_interfaces
-        .is_some()
-        .then_some(redfish::ethernet_interface::system_collection(&system_id));
-
-    let log_services = config
-        .log_services
-        .is_some()
-        .then_some(redfish::log_service::system_collection(&system_id));
-
-    let storage = config
-        .storage
-        .is_some()
-        .then_some(redfish::storage::system_collection(&system_id));
-
-    let processors = config
-        .processors
-        .is_some()
-        .then_some(redfish::processor::system_collection(&system_id));
-
-    let memory = config
-        .memory
-        .is_some()
-        .then_some(redfish::memory::system_collection(&system_id));
-
-    let secure_boot = config
-        .secure_boot_available
-        .then_some(redfish::secure_boot::resource(&system_id));
-
-    b.maybe_with(SystemBuilder::serial_number, &config.serial_number)
-        .maybe_with(SystemBuilder::manufacturer, &config.manufacturer)
-        .maybe_with(SystemBuilder::model, &config.model)
-        .maybe_with(SystemBuilder::bios, &bios)
-        .maybe_with(SystemBuilder::boot_options, &boot_options)
-        .maybe_with(SystemBuilder::ethernet_interfaces, &ethernet_interfaces)
-        .maybe_with(SystemBuilder::log_services, &log_services)
-        .maybe_with(SystemBuilder::storage, &storage)
-        .maybe_with(SystemBuilder::processors, &processors)
-        .maybe_with(SystemBuilder::memory, &memory)
-        .maybe_with(SystemBuilder::secure_boot, &secure_boot)
-        .pcie_devices(&pcie_devices)
-        .build()
-        .into_ok_response()
+    let model = ComputerSystem {
+        serial_number: config.serial_number.as_ref().map(|v| Some(v.to_string())),
+        manufacturer: config.manufacturer.as_ref().map(|v| Some(v.to_string())),
+        model: config.model.as_ref().map(|v| Some(v.to_string())),
+        bios_version: config.bios_version.as_ref().map(|v| Some(v.to_string())),
+        power_state: power_state.map(|v| match v {
+            PowerState::On => Some(ResponsePowerState::On),
+            PowerState::Off => Some(ResponsePowerState::Off),
+            PowerState::PoweringOn => Some(ResponsePowerState::PoweringOn),
+            PowerState::PoweringOff => Some(ResponsePowerState::PoweringOff),
+            PowerState::Paused => Some(ResponsePowerState::Paused),
+            PowerState::Sleeping => Some(ResponsePowerState::Sleeping),
+            PowerState::Hibernating => Some(ResponsePowerState::Hibernating),
+            PowerState::UnsupportedValue => None,
+        }),
+        bios: config.base_bios.as_ref().map(|_| {
+            redfish::bios::resource(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        ethernet_interfaces: config.eth_interfaces.as_ref().map(|_| {
+            redfish::ethernet_interface::system_collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        log_services: config.log_services.as_ref().map(|_| {
+            redfish::log_service::system_collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        storage: config.storage.as_ref().map(|_| {
+            redfish::storage::system_collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        processors: config.processors.as_ref().map(|_| {
+            redfish::processor::system_collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        memory: config.memory.as_ref().map(|_| {
+            redfish::memory::system_collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        secure_boot: config.secure_boot_available.then(|| {
+            redfish::secure_boot::resource(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        virtual_media: system_state.virtual_media().map(|_| {
+            redfish::virtual_media::collection(&system_id)
+                .odata_id
+                .into_owned()
+                .into()
+        }),
+        boot,
+        ..ComputerSystem::new(
+            resource.odata_id.as_ref(),
+            resource.id.as_ref(),
+            resource.name.as_ref(),
+        )
+    }
+    .links(
+        Links::new().chassis(
+            config
+                .chassis
+                .iter()
+                .map(|id| redfish::chassis::resource(id).odata_id.into_owned()),
+        ),
+    )
+    .pcie_devices(pcie_devices);
+    let mut document = model.into_json();
+    // Bound actions are not emitted by the server schema generator yet.
+    if config.callbacks.is_some() {
+        document = document.patch(json!({"Actions": {"#ComputerSystem.Reset": {
+            "target": reset_target(&system_id),
+            "ResetType@Redfish.AllowableValues": ["On", "ForceOn", "GracefulShutdown", "ForceOff", "GracefulRestart", "ForceRestart", "PowerCycle"]
+        }}}));
+    }
+    // This state is validated by the PATCH handler and can include vendor boot settings.
+    let boot_source_override = system_state.boot_source_override();
+    if boot_source_override
+        .as_object()
+        .is_some_and(|v| !v.is_empty())
+    {
+        document = document.patch(json!({"Boot": boot_source_override}));
+    }
+    if matches!(config.oem, Oem::NvidiaBluefield) {
+        document = document.patch(json!({"Oem": {"Nvidia": redfish::oem::nvidia::bluefield::resource(&system_id).entity_ref()}}));
+    }
+    let port = *system_state
+        .serial_console_ssh_port_override
+        .lock()
+        .expect("mutex poisoned");
+    let serial_console = match (&config.serial_console, port) {
+        (Some(console), Some(port)) => Some(console.with_ssh_port(port)),
+        (Some(console), None) => Some(console.clone()),
+        (None, Some(port)) => Some(redfish::serial_console::simulated_ssh(port)),
+        (None, None) => None,
+    };
+    if let Some(console) = serial_console {
+        document = document.patch(json!({"SerialConsole": console.to_json()}));
+    }
+    document.into_ok_response()
 }
 
-async fn get_ethernet_interface(
-    State(state): State<BmcState>,
+async fn get_ethernet_interface<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, interface_id)): Path<(String, String)>,
 ) -> Response {
     let Some(system_state) = state.system_state.find(&system_id) else {
@@ -731,8 +923,8 @@ async fn get_ethernet_interface(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_ethernet_interface_collection(
-    State(state): State<BmcState>,
+async fn get_ethernet_interface_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     let Some(system_state) = state.system_state.find(&system_id) else {
@@ -750,8 +942,8 @@ async fn get_ethernet_interface_collection(
         .into_ok_response()
 }
 
-async fn patch_settings(
-    State(state): State<BmcState>,
+async fn patch_settings<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(patch_settings): Json<serde_json::Value>,
 ) -> Response {
@@ -781,11 +973,15 @@ async fn patch_settings(
         }
         system_state.apply_boot_source_override(boot);
     }
-    json!({}).into_ok_response()
+    if matches!(state.bmc_vendor, redfish::oem::BmcVendor::Ami) {
+        http::ok_no_content()
+    } else {
+        json!({}).into_ok_response()
+    }
 }
 
-async fn patch_system(
-    State(state): State<BmcState>,
+async fn patch_system<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(patch_system): Json<serde_json::Value>,
 ) -> Response {
@@ -827,8 +1023,8 @@ async fn patch_system(
     response
 }
 
-async fn post_reset_system(
-    State(state): State<BmcState>,
+async fn post_reset_system<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(mut power_request): Json<serde_json::Value>,
 ) -> Response {
@@ -853,29 +1049,40 @@ async fn post_reset_system(
     // introduce a deadlock if the API server holds a lock on the row for this machine
     // while issuing a redfish call, and MachineStateMachine is blocked waiting for the row lock
     // to be released.
-    match callbacks.set_power_state(reset_type) {
-        Ok(_) => json!({}).into_ok_response(),
-        Err(SetSystemPowerError::BadRequest(_)) => StatusCode::BAD_REQUEST.into_response(),
-        Err(SetSystemPowerError::CommandSendError(_)) => {
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    match callbacks.computer_system_reset(reset_type).await {
+        Ok(_) => {
+            state.record_event(redfish::log_service::LogEntryDraft::reset_requested(
+                &resource(&system_id).odata_id,
+                reset_type,
+            ));
+            json!({}).into_ok_response()
         }
+        Err(ActionError::BadRequest(_)) => StatusCode::BAD_REQUEST.into_response(),
+        Err(ActionError::Internal(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-async fn get_secure_boot(State(state): State<BmcState>, Path(system_id): Path<String>) -> Response {
+async fn get_secure_boot<C: Callbacks>(
+    State(state): State<BmcState<C>>,
+    Path(system_id): Path<String>,
+) -> Response {
     let Some(system_state) = state.system_state.find(&system_id) else {
         return http::not_found();
     };
     let secure_boot_enabled = system_state.secure_boot_enabled.load(Ordering::Relaxed);
     redfish::secure_boot::builder(&redfish::secure_boot::resource(&system_id))
         .secure_boot_enable(secure_boot_enabled)
-        .secure_boot_current_boot(secure_boot_enabled)
-        .build()
+        .secure_boot_current_boot(if secure_boot_enabled {
+            redfish::schema::secure_boot::SecureBootCurrentBootType::Enabled
+        } else {
+            redfish::schema::secure_boot::SecureBootCurrentBootType::Disabled
+        })
+        .into_json()
         .into_ok_response()
 }
 
-async fn patch_secure_boot(
-    State(state): State<BmcState>,
+async fn patch_secure_boot<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(secure_boot_request): Json<serde_json::Value>,
 ) -> Response {
@@ -891,8 +1098,8 @@ async fn patch_secure_boot(
     json!({}).into_ok_response()
 }
 
-async fn get_boot_options_collection(
-    State(state): State<BmcState>,
+async fn get_boot_options_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     let Some(system_state) = state.system_state.find(&system_id) else {
@@ -931,8 +1138,8 @@ async fn get_boot_options_collection(
         .into_ok_response()
 }
 
-async fn get_boot_option(
-    State(state): State<BmcState>,
+async fn get_boot_option<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, boot_option_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -943,8 +1150,8 @@ async fn get_boot_option(
         .unwrap_or_else(http::not_found)
 }
 
-async fn patch_boot_option_settings(
-    State(state): State<BmcState>,
+async fn patch_boot_option_settings<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, boot_option_id)): Path<(String, String)>,
     Json(patch_request): Json<serde_json::Value>,
 ) -> Response {
@@ -954,28 +1161,38 @@ async fn patch_boot_option_settings(
     if !system_state.patch_boot_option(&boot_option_id, patch_request) {
         return http::not_found();
     }
-    json!({}).into_ok_response()
+    if matches!(state.bmc_vendor, redfish::oem::BmcVendor::Ami) {
+        http::ok_no_content()
+    } else {
+        json!({}).into_ok_response()
+    }
 }
 
 /// Return the HPE iLO persistent boot-order resource.
-async fn get_hpe_boot(State(state): State<BmcState>, Path(system_id): Path<String>) -> Response {
+async fn get_hpe_boot<C: Callbacks>(
+    State(state): State<BmcState<C>>,
+    Path(system_id): Path<String>,
+) -> Response {
     let Some(system_state) = state.system_state.find(&system_id) else {
         return http::not_found();
     };
     let boot_order = system_state.hpe_boot_order();
-    hpe_boot_resource(&system_id)
-        .json_patch()
-        .patch(json!({
-            "BootSources": [],
-            "DefaultBootOrder": ["PcieSlotNic", "PcieSlotStorage"],
-            "PersistentBootConfigOrder": boot_order,
-        }))
-        .into_ok_response()
+    let resource = hpe_boot_resource(&system_id);
+    super::schema::hpe_server_boot_settings::HpeServerBootSettings::new(
+        resource.odata_id.as_ref(),
+        resource.id.as_ref(),
+        resource.name.as_ref(),
+    )
+    .boot_sources([])
+    .default_boot_order(["PcieSlotNic", "PcieSlotStorage"])
+    .persistent_boot_config_order(boot_order)
+    .into_json()
+    .into_ok_response()
 }
 
 /// Apply the HPE iLO persistent boot order staged through its settings resource.
-async fn patch_hpe_boot_settings(
-    State(state): State<BmcState>,
+async fn patch_hpe_boot_settings<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(request): Json<HpeBootSettingsPatch>,
 ) -> Response {
@@ -986,8 +1203,8 @@ async fn patch_hpe_boot_settings(
     json!({}).into_ok_response()
 }
 
-async fn get_log_services_collection(
-    State(state): State<BmcState>,
+async fn get_log_services_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     state
@@ -997,20 +1214,20 @@ async fn get_log_services_collection(
         .map(|log_services| {
             let members = log_services
                 .services()
-                .into_iter()
+                .iter()
                 .map(|service| {
                     redfish::log_service::system_resource(&system_id, service.id()).entity_ref()
                 })
                 .collect::<Vec<_>>();
-            redfish::boot_option::collection(&system_id)
+            redfish::log_service::system_collection(&system_id)
                 .with_members(&members)
                 .into_ok_response()
         })
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_log_service(
-    State(state): State<BmcState>,
+async fn get_log_service<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, log_service_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1018,23 +1235,43 @@ async fn get_log_service(
         .find(&system_id)
         .and_then(|system_state| system_state.config.log_services.as_ref())
         .and_then(|log_services| log_services.find(&log_service_id))
-        .map(|_log_service| {
+        .map(|log_service| {
             redfish::log_service::builder(&redfish::log_service::system_resource(
                 &system_id,
                 &log_service_id,
             ))
-            .entries(&redfish::log_service::system_entries_collection(
-                &system_id,
-                &log_service_id,
-            ))
-            .build()
+            .entries(
+                redfish::log_service::system_entries_collection(&system_id, &log_service_id)
+                    .odata_id
+                    .as_ref(),
+            )
+            .capacity(
+                log_service.capacity(),
+                &redfish::log_service::system_clear_log_target(&system_id, &log_service_id),
+            )
             .into_ok_response()
         })
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_log_service_entries(
-    State(state): State<BmcState>,
+async fn post_clear_log<C: Callbacks>(
+    State(state): State<BmcState<C>>,
+    Path((system_id, log_service_id)): Path<(String, String)>,
+) -> Response {
+    state
+        .system_state
+        .find(&system_id)
+        .and_then(|system_state| system_state.config.log_services.as_ref())
+        .and_then(|log_services| log_services.find(&log_service_id))
+        .map(|log_service| {
+            log_service.clear();
+            http::ok_no_content()
+        })
+        .unwrap_or_else(http::not_found)
+}
+
+async fn get_log_service_entries<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, log_service_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1045,17 +1282,24 @@ async fn get_log_service_entries(
         .map(|log_service| {
             let collection =
                 redfish::log_service::system_entries_collection(&system_id, &log_service_id);
-            let members = log_service.entries(&collection);
-            collection
-                .with_members(&members)
-                .patch(json!({"Description": "Log services collection"})) // Required by libredfish
-                .into_ok_response()
+            let mut response = collection
+                .with_members(&log_service.entries(&collection))
+                .patch(json!({
+                    "Description": "Log services collection", // Required by libredfish
+                }))
+                .into_ok_response();
+            if let Some(page_size) = log_service.page_size() {
+                response
+                    .extensions_mut()
+                    .insert(redfish::query_router::PageSize(page_size));
+            }
+            response
         })
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_log_service_entry(
-    State(state): State<BmcState>,
+async fn get_log_service_entry<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, log_service_id, entry_id)): Path<(String, String, String)>,
 ) -> Response {
     state
@@ -1066,19 +1310,14 @@ async fn get_log_service_entry(
         .and_then(|log_service| {
             let collection =
                 redfish::log_service::system_entries_collection(&system_id, &log_service_id);
-            log_service.entries(&collection).into_iter().find(|entry| {
-                entry
-                    .get("Id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| id == entry_id)
-            })
+            log_service.entry(&collection, &entry_id)
         })
         .map(|entry| entry.into_ok_response())
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_storage_collection(
-    State(state): State<BmcState>,
+async fn get_storage_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     state
@@ -1092,15 +1331,15 @@ async fn get_storage_collection(
                     redfish::storage::system_resource(&system_id, &storage.id).entity_ref()
                 })
                 .collect::<Vec<_>>();
-            redfish::boot_option::collection(&system_id)
+            redfish::storage::system_collection(&system_id)
                 .with_members(&members)
                 .into_ok_response()
         })
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_processors_collection(
-    State(state): State<BmcState>,
+async fn get_processors_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     state
@@ -1121,8 +1360,8 @@ async fn get_processors_collection(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_processor(
-    State(state): State<BmcState>,
+async fn get_processor<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, processor_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1133,8 +1372,8 @@ async fn get_processor(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_processor_metrics(
-    State(state): State<BmcState>,
+async fn get_processor_metrics<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, processor_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1145,8 +1384,8 @@ async fn get_processor_metrics(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_memory_collection(
-    State(state): State<BmcState>,
+async fn get_memory_collection<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
 ) -> Response {
     state
@@ -1165,8 +1404,8 @@ async fn get_memory_collection(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_memory(
-    State(state): State<BmcState>,
+async fn get_memory<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, memory_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1177,8 +1416,8 @@ async fn get_memory(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_memory_metrics(
-    State(state): State<BmcState>,
+async fn get_memory_metrics<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path((system_id, memory_id)): Path<(String, String)>,
 ) -> Response {
     state
@@ -1189,7 +1428,10 @@ async fn get_memory_metrics(
         .unwrap_or_else(http::not_found)
 }
 
-async fn get_bios(State(state): State<BmcState>, Path(system_id): Path<String>) -> Response {
+async fn get_bios<C: Callbacks>(
+    State(state): State<BmcState<C>>,
+    Path(system_id): Path<String>,
+) -> Response {
     state
         .system_state
         .find(&system_id)
@@ -1208,8 +1450,8 @@ async fn get_bios(State(state): State<BmcState>, Path(system_id): Path<String>) 
         .unwrap_or_else(http::not_found)
 }
 
-async fn patch_bios_settings(
-    State(state): State<BmcState>,
+async fn patch_bios_settings<C: Callbacks>(
+    State(state): State<BmcState<C>>,
     Path(system_id): Path<String>,
     Json(patch_bios_request): Json<serde_json::Value>,
 ) -> Response {
@@ -1256,122 +1498,6 @@ async fn change_bios_password_action(Path(_system_id): Path<String>) -> Response
     json!({}).into_ok_response()
 }
 
-fn builder(resource: &redfish::Resource) -> SystemBuilder {
-    SystemBuilder {
-        value: resource.json_patch(),
-    }
-}
-
-struct SystemBuilder {
-    value: serde_json::Value,
-}
-
-impl Builder for SystemBuilder {
-    fn apply_patch(self, patch: serde_json::Value) -> Self {
-        Self {
-            value: self.value.patch(patch),
-        }
-    }
-}
-
-impl SystemBuilder {
-    fn serial_console(self, value: &redfish::serial_console::SerialConsole) -> Self {
-        self.apply_patch(json!({ "SerialConsole": value.to_json() }))
-    }
-
-    fn serial_number(self, v: &str) -> Self {
-        self.add_str_field("SerialNumber", v)
-    }
-
-    fn manufacturer(self, v: &str) -> Self {
-        self.add_str_field("Manufacturer", v)
-    }
-
-    fn model(self, v: &str) -> Self {
-        self.add_str_field("Model", v)
-    }
-
-    fn ethernet_interfaces(self, v: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(v.nav_property("EthernetInterfaces"))
-    }
-
-    fn boot_order(self, boot_order: &[&str]) -> Self {
-        self.apply_patch(json!({"Boot": {"BootOrder": boot_order}}))
-    }
-
-    fn boot_options(self, boot_options: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(json!({"Boot": boot_options.nav_property("BootOptions")}))
-    }
-
-    fn boot_source_override(self, value: serde_json::Value) -> Self {
-        self.apply_patch(json!({"Boot": value}))
-    }
-
-    fn virtual_media(self, value: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(value.nav_property("VirtualMedia"))
-    }
-
-    fn secure_boot(self, secure_boot: &redfish::Resource<'_>) -> Self {
-        self.apply_patch(secure_boot.nav_property("SecureBoot"))
-    }
-
-    fn pcie_devices(self, devices: &[redfish::Resource<'_>]) -> Self {
-        let devices = devices.iter().map(|r| r.entity_ref()).collect::<Vec<_>>();
-        self.apply_patch(json!({"PCIeDevices": devices}))
-    }
-
-    fn bios(self, resource: &redfish::Resource<'_>) -> Self {
-        self.apply_patch(resource.nav_property("Bios"))
-    }
-
-    fn power_state(self, state: MockPowerState) -> Self {
-        let power_state = match state {
-            MockPowerState::On => "On",
-            MockPowerState::Off => "Off",
-            MockPowerState::PowerCycling { since } => {
-                if since.elapsed() < POWER_CYCLE_DELAY {
-                    "Off"
-                } else {
-                    "On"
-                }
-            }
-        };
-        self.add_str_field("PowerState", power_state)
-    }
-
-    fn log_services(self, log_services: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(log_services.nav_property("LogServices"))
-    }
-
-    fn storage(self, storage: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(storage.nav_property("Storage"))
-    }
-
-    fn processors(self, processors: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(processors.nav_property("Processors"))
-    }
-
-    fn memory(self, memory: &redfish::Collection<'_>) -> Self {
-        self.apply_patch(memory.nav_property("Memory"))
-    }
-
-    fn link_chassis(self, ids: &[Cow<'static, str>]) -> Self {
-        let chassis = ids
-            .iter()
-            .map(|id| redfish::chassis::resource(id).entity_ref())
-            .collect::<Vec<_>>();
-        self.apply_patch(json!({"Links": {"Chassis": chassis}}))
-    }
-
-    fn oem_nvidia(self, resource: &redfish::Resource<'_>) -> Self {
-        self.apply_patch(json!({"Oem": {"Nvidia": resource.entity_ref()}}))
-    }
-
-    fn build(self) -> serde_json::Value {
-        self.value
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::Router;
@@ -1382,8 +1508,8 @@ mod tests {
     use tower_http::normalize_path::NormalizePathLayer;
 
     use super::*;
-    use crate::test_support::{NoopCallbacks, host_info};
-    use crate::{HardwareType, MachineRouterOptions, machine_router};
+    use crate::test_support::{TestBmcConfig, TestCallbacks, create_test_bmc, host_info};
+    use crate::{HardwareType, MachineRouterOptions};
 
     /// Reads one successful JSON response from the in-process mock router.
     async fn get_json(router: &Router, path: &str) -> serde_json::Value {
@@ -1397,12 +1523,198 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    #[tokio::test]
+    async fn published_power_state_only_changes_the_controlled_system() {
+        let (router, state) = create_test_bmc(
+            &host_info(HardwareType::NvidiaDgxGb300),
+            TestBmcConfig::default(),
+            "test-host-id".to_string(),
+            false,
+            MachineRouterOptions::default(),
+        );
+        assert!(state.system_state.set_power_state(PowerState::Off));
+        for (system_id, expected) in [("HGX_Baseboard_0", None), ("System_0", Some(json!("Off")))] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/redfish/v1/Systems/{system_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body.get("PowerState"), expected.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn published_power_state_preserves_low_power_states_and_marks_unknown() {
+        let (router, state) = create_test_bmc(
+            &host_info(HardwareType::NvidiaDgxGb300),
+            TestBmcConfig::default(),
+            "test-host-id".to_string(),
+            false,
+            MachineRouterOptions::default(),
+        );
+        for (observation, expected) in [
+            (PowerState::Paused, json!("Paused")),
+            (PowerState::Sleeping, json!("Sleeping")),
+            (PowerState::Hibernating, json!("Hibernating")),
+            (PowerState::UnsupportedValue, serde_json::Value::Null),
+        ] {
+            assert!(state.system_state.set_power_state(observation));
+            let body = get_json(&router, "/redfish/v1/Systems/System_0").await;
+            assert_eq!(body.get("PowerState"), Some(&expected), "{observation:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn log_services_discovery_names_the_log_collection() {
+        let (router, _) = create_test_bmc(
+            &host_info(HardwareType::DellPowerEdgeR750),
+            TestBmcConfig::default(),
+            String::new(),
+            false,
+            MachineRouterOptions::default(),
+        );
+        let path = "/redfish/v1/Systems/System.Embedded.1/LogServices";
+        let collection = get_json(&router, path).await;
+        assert_eq!(collection["@odata.id"], path);
+        assert_eq!(
+            collection["@odata.type"],
+            "#LogServiceCollection.LogServiceCollection"
+        );
+        assert_eq!(collection["Members@odata.count"], 1);
+        let member = collection["Members"][0]["@odata.id"].as_str().unwrap();
+        assert_eq!(member, format!("{path}/EventLog"));
+        let service = get_json(&router, member).await;
+        assert_eq!(service["Id"], "EventLog");
+    }
+
+    /// One POST to the in-process mock router with an empty JSON body.
+    async fn post_empty(router: &Router, path: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn dell_router() -> (Router, BmcState<TestCallbacks>) {
+        create_test_bmc(
+            &host_info(HardwareType::DellPowerEdgeR750),
+            TestBmcConfig::default(),
+            String::new(),
+            false,
+            MachineRouterOptions::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_system_advertises_its_reset_action() {
+        let (router, _) = dell_router();
+        let system_id = "System.Embedded.1";
+        let system = get_json(&router, &resource(system_id).odata_id).await;
+        let action = &system["Actions"]["#ComputerSystem.Reset"];
+        assert_eq!(action["target"], reset_target(system_id));
+        assert!(
+            action["ResetType@Redfish.AllowableValues"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("ForceOff"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_log_service_states_its_bound_and_clears_on_request() {
+        let (router, state) = dell_router();
+        let service_path = "/redfish/v1/Systems/System.Embedded.1/LogServices/EventLog";
+        let service = get_json(&router, service_path).await;
+        assert_eq!(service["OverWritePolicy"], "WrapsWhenFull");
+        assert_eq!(
+            service["MaxNumberOfRecords"],
+            redfish::log_service::DEFAULT_MAX_RECORDS
+        );
+        let target = service["Actions"]["#LogService.ClearLog"]["target"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            target,
+            format!("{service_path}/Actions/LogService.ClearLog")
+        );
+
+        let entries_path = format!("{service_path}/Entries");
+        let system = "/redfish/v1/Systems/System.Embedded.1";
+        state.record_log(redfish::log_service::LogEntryDraft::powered_on(system));
+        assert_eq!(
+            get_json(&router, &entries_path).await["Members@odata.count"],
+            2
+        );
+
+        assert_eq!(post_empty(&router, &target).await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            get_json(&router, &entries_path).await["Members@odata.count"],
+            0
+        );
+        let (_, reused) = state.record_log(redfish::log_service::LogEntryDraft::powered_on(system));
+        assert_eq!(
+            reused.as_deref(),
+            Some(format!("{entries_path}/0").as_str()),
+            "a cleared log numbers from zero again"
+        );
+        assert_eq!(
+            post_empty(
+                &router,
+                "/redfish/v1/Systems/System.Embedded.1/LogServices/Missing/Actions/LogService.ClearLog"
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_discovery_names_the_storage_collection() {
+        let (router, _) = create_test_bmc(
+            &host_info(HardwareType::DellPowerEdgeR750),
+            TestBmcConfig::default(),
+            String::new(),
+            false,
+            MachineRouterOptions::default(),
+        );
+        let path = "/redfish/v1/Systems/System.Embedded.1/Storage";
+        let collection = get_json(&router, path).await;
+        assert_eq!(collection["@odata.id"], path);
+        assert_eq!(
+            collection["@odata.type"],
+            "#StorageCollection.StorageCollection"
+        );
+        let members = collection["Members"].as_array().unwrap();
+        assert!(
+            members.is_empty(),
+            "the fixture advertises an empty Storage collection"
+        );
+        assert_eq!(collection["Members@odata.count"], 0);
+    }
+
     /// HPE OEM ordering round-trips without corrupting standard BootOption IDs.
     #[tokio::test]
     async fn hpe_boot_order_is_persisted_separately_from_standard_boot_order() {
-        let router = machine_router(
+        let router = create_test_bmc(
             &host_info(HardwareType::HpeProliantDl380aGen11),
-            Arc::new(NoopCallbacks),
+            TestBmcConfig::default(),
             "test-host-id".to_string(),
             false,
             MachineRouterOptions::default(),
@@ -1441,9 +1753,9 @@ mod tests {
 
     #[tokio::test]
     async fn simulated_ssh_port_can_be_added_without_profile_serial_console_data() {
-        let (router, state) = machine_router(
+        let (router, state) = create_test_bmc(
             &host_info(HardwareType::LenovoGB300Nvl),
-            Arc::new(NoopCallbacks),
+            TestBmcConfig::default(),
             "test-host-id".to_string(),
             false,
             MachineRouterOptions::default(),
@@ -1458,6 +1770,7 @@ mod tests {
             let system = get_json(&router, &resource(system_id).odata_id).await;
             assert_eq!(system["SerialConsole"]["SSH"]["ServiceEnabled"], true);
             assert_eq!(system["SerialConsole"]["SSH"]["Port"], 3222);
+            assert_eq!(system["SerialConsole"]["IPMI"]["ServiceEnabled"], false);
         }
     }
 }

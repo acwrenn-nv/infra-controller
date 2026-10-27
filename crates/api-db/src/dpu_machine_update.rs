@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 use model::dpu_machine_update::DpuMachineUpdate;
-use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{HostHealthConfig, LoadSnapshotOptions, ManagedHostState, ReprovisionRequest};
 use model::machine_update_module::{
     AutomaticFirmwareUpdateReference, DPU_FIRMWARE_UPDATE_TARGET, DpuReprovisionInitiator,
@@ -37,13 +36,34 @@ pub async fn get_fw_updates_running_count(txn: &mut PgConnection) -> Result<i64,
     Ok(count)
 }
 
+/// Queues every supplied DPU atomically. Returns false if a Ready DPU already
+/// has a request, preserving it and rolling back this batch. A missing Ready
+/// row remains `NotFoundError`; other database errors propagate.
 pub async fn trigger_reprovisioning_for_managed_host(
     txn: &mut PgConnection,
     machine_updates: &[DpuMachineUpdate],
-) -> Result<(), DatabaseError> {
+) -> Result<bool, DatabaseError> {
     let mut inner_txn = Transaction::begin_inner(txn).await?;
 
     for machine_update in machine_updates {
+        let query = r#"SELECT reprovisioning_requested IS NOT NULL FROM machines
+            WHERE controller_state = '{"state": "ready"}' AND id = $1 FOR UPDATE"#;
+        let has_request: bool = sqlx::query_scalar(query)
+            .bind(machine_update.dpu_machine_id)
+            .fetch_one(inner_txn.as_pgconn())
+            .await
+            .map_err(|error| match error {
+                sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                    kind: "trigger_reprovisioning_for_managed_host",
+                    id: machine_update.dpu_machine_id.to_string(),
+                },
+                _ => DatabaseError::query(query, error),
+            })?;
+        if has_request {
+            inner_txn.rollback().await?;
+            return Ok(false);
+        }
+
         let initiator = DpuReprovisionInitiator::Automatic(AutomaticFirmwareUpdateReference {
             from: machine_update.firmware_version.clone(),
             to: "".to_string(),
@@ -59,7 +79,9 @@ pub async fn trigger_reprovisioning_for_managed_host(
             restart_reprovision_requested_at: reprovision_time,
         };
 
-        let query = r#"UPDATE machines SET reprovisioning_requested=$1 WHERE controller_state = '{"state": "ready"}' AND id=$2 RETURNING id"#;
+        let query = r#"UPDATE machines SET reprovisioning_requested=$1
+            WHERE controller_state = '{"state": "ready"}' AND id=$2
+            AND reprovisioning_requested IS NULL RETURNING id"#;
         sqlx::query(query)
             .bind(sqlx::types::Json(req))
             .bind(machine_update.dpu_machine_id)
@@ -76,7 +98,7 @@ pub async fn trigger_reprovisioning_for_managed_host(
 
     inner_txn.commit().await?;
 
-    Ok(())
+    Ok(true)
 }
 
 pub async fn get_reprovisioning_machines(
@@ -104,14 +126,7 @@ pub async fn get_updated_machines(
     txn: &mut PgConnection,
     host_health_config: HostHealthConfig,
 ) -> Result<Vec<DpuMachineUpdate>, DatabaseError> {
-    let machine_ids = crate::machine::find_machine_ids(
-        &mut *txn,
-        MachineSearchConfig {
-            include_predicted_host: true,
-            ..Default::default()
-        },
-    )
-    .await?;
+    let machine_ids = crate::managed_host::load_host_ids(&mut *txn).await?;
     let snapshots = crate::managed_host::load_by_machine_ids(
         txn,
         &machine_ids,
@@ -159,25 +174,29 @@ pub async fn get_updated_machines(
             // We only signal an update as complete once ALL DPUs are done
             // That prevents removing the updating flags from the Host
             // if just one DPU completes the update
-            let completed_updates: Vec<DpuMachineUpdate> = managed_host
+            let completed_updates: Result<Vec<DpuMachineUpdate>, DatabaseError> = managed_host
                 .dpu_snapshots
                 .iter()
-                .map(|dpu| DpuMachineUpdate {
-                    host_machine_id: machine_id,
-                    dpu_machine_id: dpu.id,
-                    firmware_version: dpu
-                        .status
-                        .hardware_info
-                        .as_ref()
-                        .and_then(|info| info.dpu_info.as_ref())
-                        .map(|dpu_info| dpu_info.firmware_version.clone())
-                        .unwrap_or_default(),
-                    dpf_managed,
+                .map(|dpu| {
+                    Ok(DpuMachineUpdate {
+                        host_machine_id: machine_id,
+                        dpu_machine_id: dpu.id,
+                        firmware_version: dpu
+                            .status
+                            .hardware_info
+                            .as_ref()
+                            .and_then(|info| info.dpu_info.as_ref())
+                            .map(|dpu_info| dpu_info.firmware_version.clone())
+                            .unwrap_or_default(),
+                        dpf_managed,
+                    })
                 })
                 .collect();
 
             Some(completed_updates)
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .flatten()
         .collect();
 

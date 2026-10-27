@@ -31,6 +31,10 @@ import (
 	cwutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 )
 
+// systemTenantOrganizationID is the organization Core assigns to its own admin VPC
+// (crates/api-core/src/db_init.rs). That VPC is system-owned and never a REST tenant VPC.
+const systemTenantOrganizationID = "carbide_internal"
+
 // ManageVpc is an activity wrapper for managing VPC lifecycle that allows
 // injecting DB access
 type ManageVpc struct {
@@ -52,7 +56,7 @@ func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInv
 
 	stDAO := cdbm.NewSiteDAO(mv.dbSession)
 
-	site, err := stDAO.GetByID(ctx, nil, siteID, nil, false)
+	site, err := stDAO.GetByID(ctx, nil, siteID, nil, false, false)
 	if err != nil {
 		if err == cdb.ErrDoesNotExist {
 			logger.Warn().Err(err).Msg("received VPC inventory for unknown or deleted Site")
@@ -381,7 +385,7 @@ func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInv
 	vpcsToDelete := []*cdbm.Vpc{}
 
 	// If inventory paging is enabled, we only need to do this once and we do it on the last page
-	if vpcInventory.InventoryPage == nil || vpcInventory.InventoryPage.TotalPages == 0 || (vpcInventory.InventoryPage.CurrentPage == vpcInventory.InventoryPage.TotalPages) {
+	if util.ShouldReconcileDeletions(vpcInventory.GetInventoryPage()) {
 		for _, vpc := range existingVpcIDMap {
 			found := false
 
@@ -476,6 +480,9 @@ func (mv ManageVpc) createOrUpdateVpcFromSite(
 
 	reportedVpc := new(cdbm.Vpc)
 	reportedVpc.FromProto(controllerVpc)
+	if reportedVpc.Org == systemTenantOrganizationID {
+		return nil
+	}
 	if reportedVpc.Name == "" {
 		reportedVpc.Name = fmt.Sprintf("recovered-%s", vpcID.String()[:8])
 	}
@@ -505,6 +512,14 @@ func (mv ManageVpc) createOrUpdateVpcFromSite(
 				logger.Warn().Msg(fmt.Sprintf("unable to create VPC found on Site: tenant organization differs in REST cache and Site record %s", reportedVpc.Org))
 				return nil, nil
 			}
+			// Deleted records when the delete happened, so a delete newer than the interval can
+			// postdate this inventory. Undeleting then would revive a VPC the snapshot never saw
+			// removed. A later inventory undeletes it if the Site still reports it.
+			if site.IsTimeWithinStaleInventoryThreshold(*existingVpc.Deleted) {
+				logger.Info().Msgf("not undeleting VPC %s yet because it was deleted more recently than the inventory interval", vpcID)
+				return nil, nil
+			}
+
 			// Undelete only; UpdateVpcsInDB applies Site-reported field updates.
 			restored, clearErr := vpcDAO.Clear(ctx, tx, cdbm.VpcClearInput{VpcID: existingVpc.ID, Deleted: true})
 			if clearErr != nil {
@@ -668,10 +683,11 @@ func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc 
 		TaskQueue: queue.SiteTaskQueue,
 	}
 
-	// Prepare the config update request workflow object. NetworkSecurityGroupId is
-	// intentionally omitted: this activity only syncs metadata fields.
+	// Carry the persisted NSG association while syncing metadata because Core
+	// treats an omitted NetworkSecurityGroupId as detachment.
 	updateVpcRequest := &corev1.VpcUpdateRequest{
-		Id: &corev1.VpcId{Value: vpc.ID.String()},
+		Id:                     &corev1.VpcId{Value: vpc.ID.String()},
+		NetworkSecurityGroupId: vpc.NetworkSecurityGroupID,
 		Metadata: &corev1.Metadata{
 			Name:        vpc.Name,
 			Description: description,
@@ -681,7 +697,7 @@ func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc 
 
 	we, err := tc.ExecuteWorkflow(ctx, workflowOptions, "UpdateVPC", updateVpcRequest)
 	if err != nil {
-		logger.Error().Err(err).Str("VPC ID", vpc.ID.String()).Msg("failed to trigger workflow to update VPC Metadata")
+		logger.Error().Err(err).Msg("failed to trigger workflow to update VPC Metadata")
 	} else {
 		logger.Info().Str("Workflow ID", we.GetID()).Msg("triggered workflow to update VPC Metadata")
 	}
@@ -704,7 +720,7 @@ func NewManageVpc(dbSession *cdb.Session, siteClientPool *sc.ClientPool, tc clie
 type ManageVpcLifecycleMetrics struct {
 	dbSession            *cdb.Session
 	statusTransitionTime *prometheus.GaugeVec
-	siteIDNameMap        map[uuid.UUID]string
+	siteNames            *cwm.SiteNameCache
 }
 
 // RecordVpcStatusTransitionMetrics is a Temporal activity that records duration of important status transitions for VPCs
@@ -713,17 +729,10 @@ func (mvlm ManageVpcLifecycleMetrics) RecordVpcStatusTransitionMetrics(ctx conte
 
 	logger.Info().Msg("starting activity")
 
-	// Cache site name to avoid repeated DB call
-	siteName, ok := mvlm.siteIDNameMap[siteID]
-	if !ok {
-		siteDAO := cdbm.NewSiteDAO(mvlm.dbSession)
-		site, err := siteDAO.GetByID(context.Background(), nil, siteID, nil, false)
-		if err != nil {
-			logger.Error().Err(err).Str("Site ID", siteID.String()).Msg("failed to retrieve Site from DB")
-			return err
-		}
-		siteName = site.Name
-		mvlm.siteIDNameMap[siteID] = siteName
+	siteName, err := mvlm.siteNames.Get(ctx, mvlm.dbSession, siteID)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to retrieve Site from DB")
+		return err
 	}
 
 	logger.Info().Int("EventCount", len(vpcLifecycleEvents)).Str("Site Name", siteName).Msg("processing vpc lifecycle events")
@@ -758,7 +767,7 @@ func (mvlm ManageVpcLifecycleMetrics) RecordVpcStatusTransitionMetrics(ctx conte
 				// Calculate duration from Deleting status to deletion time
 				duration := event.Deleted.Sub(deletingStatusDetail.Created)
 				// Note: VPC doesn't have VpcStatusDeleted constant, so we use string "Deleted"
-				mvlm.statusTransitionTime.WithLabelValues(siteName, cwm.InventoryOperationTypeDelete, cdbm.VpcStatusDeleting, "Deleted").Set(duration.Seconds())
+				mvlm.statusTransitionTime.WithLabelValues(siteName, siteID.String(), cwm.InventoryOperationTypeDelete, cdbm.VpcStatusDeleting, "Deleted").Set(duration.Seconds())
 				metricsRecorded++
 				logger.Info().
 					Str("VPC ID", event.ObjectID.String()).
@@ -779,18 +788,18 @@ func (mvlm ManageVpcLifecycleMetrics) RecordVpcStatusTransitionMetrics(ctx conte
 }
 
 // NewManageVpcLifecycleMetrics returns a new ManageVpcLifecycleMetrics activity
-func NewManageVpcLifecycleMetrics(reg prometheus.Registerer, dbSession *cdb.Session) ManageVpcLifecycleMetrics {
+func NewManageVpcLifecycleMetrics(reg prometheus.Registerer, dbSession *cdb.Session, namespace string) ManageVpcLifecycleMetrics {
 	lifecycleMetrics := ManageVpcLifecycleMetrics{
 		dbSession: dbSession,
 		statusTransitionTime: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
-				Namespace: cwm.MetricsNamespace,
+				Namespace: namespace,
 				Name:      "vpc_operation_latency_seconds",
-				Help:      "Current latency of vpc operations",
+				Help:      "Latency in seconds of the most recently recorded completed VPC operation for each label set on this worker replica",
 			},
-			[]string{"site", "operation_type", "from_status", "to_status"}),
+			[]string{"site", "site_id", "operation_type", "from_status", "to_status"}),
 
-		siteIDNameMap: map[uuid.UUID]string{},
+		siteNames: cwm.NewSiteNameCache(),
 	}
 	reg.MustRegister(lifecycleMetrics.statusTransitionTime)
 

@@ -70,6 +70,20 @@ pub(crate) struct BiancaBoard<'a> {
 struct GpuChassisIds {
     chassis_id: Cow<'static, str>,
     pcie_device_id: Cow<'static, str>,
+    index: usize,
+}
+
+const GPU_MODEL: &str = "GB200 186GB HBM3e";
+
+/// Stable per-slot GPU UUID, so a test can assert that a given slot reports a
+/// specific device identity.
+///
+/// Hardware reports one UUID per GPU on the GPU's `Processor`, its enclosing
+/// `Chassis` and its `PCIeDevice` alike, so every fixture for a slot uses this.
+fn gpu_uuid(index: usize) -> redfish::schema::resource::Uuid {
+    format!("2b8c1f4a-6d33-4a11-9c02-7f5e0a1b{index:04x}")
+        .parse()
+        .expect("fixture GPU UUID")
 }
 
 impl BiancaBoard<'_> {
@@ -92,7 +106,7 @@ impl BiancaBoard<'_> {
         );
         redfish::chassis::SingleChassisConfig {
             id,
-            chassis_type: "Component".into(),
+            chassis_type: redfish::schema::chassis::ChassisType::Component,
             manufacturer: Some("NVIDIA".into()),
             part_number: Some("900-2G548-0001-000".into()),
             model: Some("Grace A02P".into()),
@@ -116,6 +130,7 @@ impl BiancaBoard<'_> {
             GpuChassisIds {
                 chassis_id: format!("HGX_GPU_{n}").into(),
                 pcie_device_id: format!("GPU_{n}").into(),
+                index: n,
             }
         })
     }
@@ -130,6 +145,11 @@ impl BiancaBoard<'_> {
                 redfish::sensor::chassis_resource(&ids.chassis_id, &voltage_sensor_id)
                     .odata_id
                     .as_ref(),
+                &redfish::processor::GpuIdentity {
+                    uuid: gpu_uuid(ids.index),
+                    serial_number: &self.gpu_serial_number,
+                    model: GPU_MODEL,
+                },
             )
         })
     }
@@ -159,20 +179,22 @@ impl BiancaBoard<'_> {
                 },
             );
             redfish::chassis::SingleChassisConfig {
-                chassis_type: "Component".into(),
+                chassis_type: redfish::schema::chassis::ChassisType::Component,
                 manufacturer: Some("NVIDIA".into()),
                 part_number: Some("NA".into()),
-                model: Some("GB200 186GB HBM3e".into()),
+                model: Some(GPU_MODEL.into()),
                 serial_number: Some(self.gpu_serial_number.to_string().into()),
+                uuid: Some(gpu_uuid(ids.index)),
                 pcie_devices: Some(vec![
                     redfish::pcie_device::builder(&redfish::pcie_device::chassis_resource(
                         &ids.chassis_id,
                         &ids.pcie_device_id,
                     ))
                     .manufacturer("NVIDIA")
-                    .model("GB200 186GB HBM3e")
+                    .model(GPU_MODEL)
                     .part_number("2941-892-A1")
-                    .serial_number(&self.gpu_serial_number)
+                    .serial_number(self.gpu_serial_number.as_ref())
+                    .uuid(gpu_uuid(ids.index))
                     .build(),
                 ]),
                 id: ids.chassis_id,
@@ -200,7 +222,7 @@ impl IoBoard<'_> {
             },
         );
         redfish::chassis::SingleChassisConfig {
-            chassis_type: "Component".into(),
+            chassis_type: redfish::schema::chassis::ChassisType::Component,
             manufacturer: Some("Nvidia".into()),
             part_number: Some("900-24768-0002-000".into()),
             model: Some("2x ConnectX-7 Mezz".into()),
@@ -217,7 +239,7 @@ impl IoBoard<'_> {
                         .manufacturer("Nvidia")
                         .model("2x ConnectX-7 Mezz")
                         .part_number("900-24768-0002-000")
-                        .serial_number(&self.serial_number)
+                        .serial_number(self.serial_number.as_ref())
                         .build()
                     })
                     .collect(),

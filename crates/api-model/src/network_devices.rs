@@ -19,7 +19,7 @@ use core::fmt;
 use std::fmt::Display;
 use std::net::IpAddr;
 
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::DpuMachineId;
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 
@@ -118,9 +118,10 @@ impl<'r> FromRow<'r, PgRow> for NetworkDevice {
 /// A entry represents connection between DPU and its port with a network device.
 // TODO: Add switch port name also. It will be easy to find connecting port at switch and use it for
 // debugging.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, carbide_macros::DbTable)]
+#[db_table(name = "port_to_network_device_map")]
 pub struct DpuToNetworkDeviceMap {
-    pub dpu_id: MachineId,
+    pub dpu_id: DpuMachineId,
     pub local_port: DpuLocalPorts,
     pub remote_port: String,
     pub network_device_id: String,

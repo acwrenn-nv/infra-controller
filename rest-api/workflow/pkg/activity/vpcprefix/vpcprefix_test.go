@@ -21,6 +21,7 @@ import (
 	cipam "github.com/NVIDIA/infra-controller/rest-api/ipam"
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
+	cwu "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
@@ -394,18 +395,17 @@ func TestManageVpcPrefix_UpdateVpcPrefixesInDB(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                     string
-		fields                   fields
-		args                     args
-		updatedVpcPrefix         *cdbm.VpcPrefix
-		deletingVpcPrefixes      []*cdbm.VpcPrefix
-		readyVpcPrefixes         []*cdbm.VpcPrefix
-		deletedStatusVpcPrefixes []*cdbm.VpcPrefix
-		deletedVpcPrefixes       []*cdbm.VpcPrefix
-		missingVpcPrefixes       []*cdbm.VpcPrefix
-		restoredVpcPrefixes      []*cdbm.VpcPrefix
-		unpairedVpcPrefixes      []*cdbm.VpcPrefix
-		wantErr                  bool
+		name                string
+		fields              fields
+		args                args
+		updatedVpcPrefix    *cdbm.VpcPrefix
+		deletingVpcPrefixes []*cdbm.VpcPrefix
+		readyVpcPrefixes    []*cdbm.VpcPrefix
+		deletedVpcPrefixes  []*cdbm.VpcPrefix
+		missingVpcPrefixes  []*cdbm.VpcPrefix
+		restoredVpcPrefixes []*cdbm.VpcPrefix
+		unpairedVpcPrefixes []*cdbm.VpcPrefix
+		wantErr             bool
 	}{
 		{
 			name: "test Vpc Prefix inventory processing error, non-existent Site",
@@ -481,13 +481,12 @@ func TestManageVpcPrefix_UpdateVpcPrefixesInDB(t *testing.T) {
 					},
 				},
 			},
-			updatedVpcPrefix:         vpcPrefix12,
-			deletingVpcPrefixes:      []*cdbm.VpcPrefix{vpcPrefix3, vpcPrefix4, vpcPrefix10, vpcPrefix13},
-			deletedStatusVpcPrefixes: []*cdbm.VpcPrefix{vpcPrefix14},
-			deletedVpcPrefixes:       []*cdbm.VpcPrefix{vpcPrefix5, vpcPrefix6},
-			missingVpcPrefixes:       []*cdbm.VpcPrefix{vpcPrefix7, vpcPrefix11},
-			restoredVpcPrefixes:      []*cdbm.VpcPrefix{vpcPrefix8},
-			wantErr:                  false,
+			updatedVpcPrefix:    vpcPrefix12,
+			deletingVpcPrefixes: []*cdbm.VpcPrefix{vpcPrefix3, vpcPrefix4, vpcPrefix10, vpcPrefix13, vpcPrefix14},
+			deletedVpcPrefixes:  []*cdbm.VpcPrefix{vpcPrefix5, vpcPrefix6},
+			missingVpcPrefixes:  []*cdbm.VpcPrefix{vpcPrefix7, vpcPrefix11},
+			restoredVpcPrefixes: []*cdbm.VpcPrefix{vpcPrefix8},
+			wantErr:             false,
 		},
 		{
 			name: "test paged Vpc Prefix inventory processing, empty inventory",
@@ -594,12 +593,6 @@ func TestManageVpcPrefix_UpdateVpcPrefixesInDB(t *testing.T) {
 				rv, _ := vpcPrefixDAO.GetByID(ctx, nil, vpcPrefix.ID, nil)
 				assert.False(t, rv.IsMissingOnSite)
 				assert.Equal(t, cdbm.VpcPrefixStatusDeleting, rv.Status)
-			}
-
-			for _, vpcPrefix := range tt.deletedStatusVpcPrefixes {
-				rv, _ := vpcPrefixDAO.GetByID(ctx, nil, vpcPrefix.ID, nil)
-				assert.False(t, rv.IsMissingOnSite)
-				assert.Equal(t, cdbm.VpcPrefixStatusDeleted, rv.Status)
 			}
 
 			for _, vpcPrefix := range tt.deletedVpcPrefixes {
@@ -760,7 +753,7 @@ func testManageVpcPrefixUpdateVpcPrefixesInDBAutoCreatesAndRestores(t *testing.T
 		assert.Equal(t, tenant.ID, created.TenantID)
 		assert.Equal(t, tenantOrg, created.Org)
 		assert.Equal(t, site.ID, created.SiteID)
-		assert.Equal(t, site.CreatedBy, created.CreatedBy)
+		assert.Equal(t, parentVpc.CreatedBy, created.CreatedBy)
 		assert.Equal(t, cdbm.VpcPrefixStatusReady, created.Status)
 		assert.Equal(t, "site-created-vpc-prefix", created.Name)
 		assert.Equal(t, "10.20.30.0/24", created.Prefix)
@@ -855,6 +848,9 @@ func testManageVpcPrefixUpdateVpcPrefixesInDBAutoCreatesAndRestores(t *testing.T
 			ctx, nil, dbSession, ipamStorage, ipBlock, controllerVpcPrefix.Config.Prefix,
 		))
 		require.NoError(t, vpcPrefixDAO.Delete(ctx, nil, controllerVpcPrefixID))
+		// The undelete is deferred while the delete is newer than the staleness threshold, so
+		// backdate it past that.
+		cwu.TestInventoryAgeDeletedTimestamp(ctx, t, dbSession, (*cdbm.VpcPrefix)(nil), controllerVpcPrefixID)
 
 		deleted, _, err := vpcPrefixDAO.GetAll(
 			ctx,
@@ -921,7 +917,7 @@ func testManageVpcPrefixUpdateVpcPrefixesInDBAutoCreatesAndRestores(t *testing.T
 		}()
 
 		// Depends on the preceding TERMINATING subtest leaving the row soft-deleted with
-		// Status=Deleting. Do not soft-delete here — that would hide failures in the prior case.
+		// Status=Deleting. Do not soft-delete here, that would hide failures in the prior case.
 		existing, _, err := vpcPrefixDAO.GetAll(
 			ctx,
 			nil,
@@ -1054,6 +1050,25 @@ func TestManageVpcPrefix_CreateOrUpdateVpcPrefixFromSite(t *testing.T) {
 		ipBlock.InfrastructureProviderID.String(), ipBlock.SiteID.String(),
 	)
 	require.NoError(t, err)
+	_, err = cdbm.NewIPBlockDAO(dbSession).Create(
+		ctx,
+		nil,
+		cdbm.IPBlockCreateInput{
+			Name:                     "tenant-site-prefix",
+			SiteID:                   site.ID,
+			InfrastructureProviderID: provider.ID,
+			TenantID:                 &authorizedTenant.ID,
+			SitePrefixID:             cutil.GetPtr(uuid.New()),
+			Managed:                  cutil.GetPtr(false),
+			RoutingType:              cdbm.IPBlockRoutingTypeDatacenterOnly,
+			Prefix:                   "10.6.0.0",
+			PrefixLength:             16,
+			ProtocolVersion:          cdbm.IPBlockProtocolVersionV4,
+			Status:                   cdbm.IPBlockStatusReady,
+			CreatedBy:                &authorizedTenantUser.ID,
+		},
+	)
+	require.NoError(t, err)
 	ipamer := cipam.NewWithStorage(ipamStorage)
 	ipamer.SetNamespace(ipam.GetIpamNamespaceForIPBlock(
 		ctx, ipBlock.RoutingType, ipBlock.InfrastructureProviderID.String(), ipBlock.SiteID.String(),
@@ -1179,6 +1194,19 @@ func TestManageVpcPrefix_CreateOrUpdateVpcPrefixFromSite(t *testing.T) {
 			wantVpcPrefix: true,
 			wantName:      "rest-id-parent-vpc-prefix",
 		},
+		{
+			name: "ignores a more-specific TenantManaged SitePrefix without legacy IPAM",
+			controllerVpcPrefix: &corev1.VpcPrefix{
+				Id:    &corev1.VpcPrefixId{Value: uuid.NewString()},
+				VpcId: &corev1.VpcId{Value: parentVpc.ID.String()},
+				Config: &corev1.VpcPrefixConfig{
+					Prefix: "10.6.1.0/24",
+				},
+				Metadata: &corev1.Metadata{Name: "tenant-site-prefix-child"},
+			},
+			wantVpcPrefix: true,
+			wantName:      "tenant-site-prefix-child",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1272,6 +1300,9 @@ func TestManageVpcPrefix_CreateOrUpdateVpcPrefixFromSite(t *testing.T) {
 			require.NoError(t, err)
 			err = testVpcPrefixDAO.Delete(testCtx, nil, controllerVpcPrefixID)
 			require.NoError(t, err)
+			// The undelete is deferred while the delete is newer than the staleness threshold,
+			// so backdate it past that.
+			cwu.TestInventoryAgeDeletedTimestamp(testCtx, t, testDBSession, (*cdbm.VpcPrefix)(nil), controllerVpcPrefixID)
 
 			if test.storedIPBlockStatus != cdbm.IPBlockStatusReady {
 				_, err = cdbm.NewIPBlockDAO(testDBSession).Update(testCtx, nil, cdbm.IPBlockUpdateInput{
@@ -1686,7 +1717,7 @@ func TestManageVpcPrefix_DeleteVpcPrefixFromDB(t *testing.T) {
 }
 
 func testCreateOrUpdateVpcPrefixSkipsIDOwnedByDifferentSite(t *testing.T) {
-	// Same controller UUID under another site must skip cleanly — not unique-constraint-fail every cycle.
+	// Same controller UUID under another site must skip cleanly, not unique-constraint-fail every cycle.
 	ctx := context.Background()
 	dbSession := testVpcPrefixInitDB(t)
 	defer dbSession.Close()

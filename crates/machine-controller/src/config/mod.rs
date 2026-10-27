@@ -50,9 +50,9 @@ pub struct MachineStateHandlerSiteConfig {
     /// host ingestion skips enabling Astra on declared CX9 NICs.
     pub astra_enabled: bool,
     pub dpf_enabled: bool,
-    /// Site-wide enable for releasing the DPF maintenance hold so a changed
-    /// DPUService rolls out. When `false`, a host that DPF has parked in the
-    /// NodeEffect phase keeps its hold and its pending marker.
+    /// Site-wide enable for releasing DPF maintenance holds so changed DPUDeployment-owned
+    /// DPUService revisions roll out. Direct, detached DPUService objects do not use this setting.
+    /// When `false`, a host parked in the NodeEffect phase keeps its hold and pending marker.
     pub dpu_service_sync_enabled: bool,
     pub spdm_enabled: bool,
 
@@ -67,6 +67,13 @@ pub struct MachineStateHandlerSiteConfig {
     /// the per-machine operator force-converge escape hatch still works
     /// regardless, for the host or an individual DPU.
     pub uefi_rotation_enabled: bool,
+
+    /// Site-wide kill-switch for the passive SuperNIC lockdown IKM rekey guard.
+    /// When `false` (the default), a Ready host never enters
+    /// `RotatingNicLockdown` on its own even if a card lags the staged site-wide
+    /// target; the per-host operator force-converge escape hatch still works
+    /// regardless.
+    pub nic_lockdown_ikm_rotation_enabled: bool,
 
     /// Site-wide opt-in for factory-resetting the host BMC during tenant
     /// release. When `false` (the default), tenant release skips the BMC
@@ -96,6 +103,7 @@ impl MachineStateHandlerSiteConfig {
             spdm_enabled: false,
             bmc_rotation_enabled: false,
             uefi_rotation_enabled: false,
+            nic_lockdown_ikm_rotation_enabled: false,
             bmc_factory_reset_on_instance_termination_enabled: false,
             dpu_enable_secure_boot: true,
             restart_ovs_on_use_admin_network_change: false,

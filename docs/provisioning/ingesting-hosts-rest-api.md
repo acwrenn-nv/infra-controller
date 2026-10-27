@@ -8,7 +8,7 @@ Make sure the following are in place before you begin:
 
 1. NICo is deployed and the REST API service is reachable at a known URL.
 1. You have `nicocli` installed (`make nico-cli` from the infra-controller repo) and a working config under `~/.nico/`. For setup, authentication, and config conventions, see the [Quick Start Guide](../getting-started/quick-start.md) and the nicocli reference guide.
-1. You hold the `PROVIDER_ADMIN` role in the org you are operating in. Tenant Admins with `targetedInstanceCreation` capability can also register Expected Machines, but the canonical path is provider-side.
+1. You hold the `PROVIDER_ADMIN` role in the org you are operating in. Tenant Admins with [effective targeted instance creation](../configuration/tenant_management.md#granting-targeted-instance-creation) at the site can also register Expected Machines, but the canonical path is provider-side.
 1. DHCP requests from all managed host BMC networks have been forwarded to the NICo DHCP service.
 1. For every host you plan to register, you have:
    - The MAC address of the host BMC
@@ -28,7 +28,7 @@ nicocli user get
 
 An Expected Machine pre-registers a physical machine so NICo can authenticate to it on discovery and accept it for ingestion. Each Expected Machine carries the factory default BMC credentials NICo uses for first contact, plus identifying information (chassis serial, optional rack/SKU metadata).
 
-The Expected Machine endpoints are scoped per-org per-site. All requests require `PROVIDER_ADMIN` (or `TENANT_ADMIN` with `targetedInstanceCreation`).
+The Expected Machine endpoints are scoped per-org per-site. All requests require `PROVIDER_ADMIN`, or `TENANT_ADMIN` with [effective targeted instance creation](../configuration/tenant_management.md#granting-targeted-instance-creation) at that site.
 
 ### Single Machine
 
@@ -66,7 +66,7 @@ Optional flags add metadata or pre-allocate resources:
 | ---- | ------- |
 | `--bmc-ip-address` | Pre-allocate a reserved BMC IP (IPv4 or IPv6) instead of letting DHCP assign one |
 | `--rack-id` | Associate with a rack identifier |
-| `--sku-id` | Associate with a SKU |
+| `--sku-id` | Assign an existing SKU from the Site selected by `--site-id` to the host when it is discovered; refer to [Assign a SKU through the expected machine](sku-validation.md#assign-a-sku-through-the-expected-machine) for validation and omission behavior |
 | `--manufacturer`, `--model`, `--firmware-version`, `--name`, `--description` | Free-text hardware metadata |
 | `--slot-id`, `--tray-idx`, `--host-id` | Physical placement within a rack/tray |
 
@@ -181,7 +181,13 @@ A `Ready` machine has `status: Ready` and `isUsableByTenant: true`. Once at leas
 
 With machines ingested and `Ready`, follow the relevant API flow in the REST API Getting Started reference:
 
-- **Service Account**: create Network Allocations against each Site IP Block, create a VPC, create a VPC Prefix or Subnet, create an Operating System, create an Instance.
+- **Service Account**: create Network Allocations against each Site IP Block,
+  create a VPC, wait until it is `Ready`, and create the matching tenant
+  network resource. `FNN` VPCs use VPC Prefixes; `ETHERNET_VIRTUALIZER` VPCs
+  use IPv4 Subnets from a `Ready` tenant-allocated IPv4 IP Block at the VPC's
+  Site; `FLAT` VPCs use neither resource. For a `FLAT` VPC, set `autoNetwork`
+  to `true` and omit `interfaces` when creating the Instance. Then create an
+  Operating System and an Instance.
 - **Provider**: create Tenant Accounts, create Instance Types, associate machines with Instance Types, create Compute and Network Allocations for tenants.
 
 Both flows assume hardware ingestion is complete -- which this page covers.
@@ -208,7 +214,7 @@ Before pairing can occur, Site Explorer must successfully explore each BMC endpo
 | `ConnectionTimeout` | BMC unreachable on the OOB network; check cabling and DHCP routing |
 | `ConnectionRefused` | No Redfish API exposed at the target IP; the DPU admin IP is often mistakenly probed here |
 | `Unauthorized` / `AvoidLockout` | BMC credentials do not match the Expected Machine entry or site vault; see [Adding New Machines: BMC Password Requirements](../playbooks/stuck_objects/adding_new_machines.md) |
-| `MissingCredentials` | Credentials not yet available in vault; check that site-wide BMC credentials are configured |
+| `MissingCredentials` | Credentials not yet available from any configured credential source; check that site-wide BMC credentials are configured |
 | `UnsupportedVendor` | BMC vendor is not supported by this version of NICo |
 | `RedfishError` | Unexpected Redfish response; check BMC firmware version and `nico-api` logs for the full response body |
 | `InvalidDpuRedfishBiosResponse` | DPU BIOS endpoint returned an unexpected response; the DPU may need a fresh OS install |
@@ -260,6 +266,10 @@ nicocli expected-machine batch-update --data-file updates.json
 ```
 
 Where `updates.json` is a JSON array of `ExpectedMachineUpdateRequest` objects. Each entry must include the `id` field identifying which Expected Machine to update; other fields are merged onto the existing record.
+
+All items must supply the same set of fields, except that `bmcIpAddress` can be omitted or null to preserve that
+machine's address. To update `skuId`, supply it in every item; the values can differ. To preserve all SKU
+associations, omit `skuId` or set it to `null` in every item.
 
 ### Export
 

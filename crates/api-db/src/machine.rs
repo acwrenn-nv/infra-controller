@@ -18,13 +18,17 @@
 //! Machine - represents a database-backed Machine object
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::FromStr;
 
 use carbide_uuid::dpa_interface::DpaInterfaceId;
 use carbide_uuid::instance_type::InstanceTypeId;
-use carbide_uuid::machine::{HostMachineId, MachineId, MachineType};
+use carbide_uuid::machine::{
+    DpuMachineId, HostMachineId, MachineId, MachineIdSubtypeTrait, MachineType,
+    PredictedHostMachineId, StableHostMachineId,
+};
 use carbide_uuid::machine_validation::MachineValidationId;
 use carbide_uuid::rack::{RackId, RackProfileId};
 use chrono::{DateTime, Utc};
@@ -48,25 +52,29 @@ use model::machine::network::{
 };
 use model::machine::nvlink::MachineNvLinkStatusObservation;
 use model::machine::spx::MachineSpxStatusObservation;
+use model::machine::spx_multiplane::{MachineSpxMultiplane, MachineSpxMultiplaneStatus};
+use model::machine::status::MlxDeviceObservation;
 use model::machine::upgrade_policy::AgentUpgradePolicy;
 use model::machine::{
-    CURRENT_STATE_MODEL_VERSION, Dpf, DpuInfo, DpuInfoStatusObservation, DpuOsOperationalState,
-    DpuRepresentorStatus, FailureDetails, HostProfile, Machine, MachineInterfaceSnapshot,
+    AnyMachine, CURRENT_STATE_MODEL_VERSION, Dpf, DpuAgentUpgradeStatus, DpuInfo,
+    DpuInfoStatusObservation, DpuMachine, DpuOsOperationalState, DpuRepresentorStatus,
+    FailureDetails, HostMachine, HostProfile, Machine, MachineInterfaceSnapshot,
     MachineLastRebootRequested, MachineLastRebootRequestedMode, MachineMaintenanceOperation,
-    MachineValidationContext, ManagedHostState, ReprovisionRequest, UpgradeDecision,
+    MachineValidationContext, ManagedHostState, ReprovisionRequest, ResetRequest, UpgradeDecision,
 };
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::metadata::Metadata;
+use model::nic_firmware::NicFirmwareProfileId;
 use model::resource_pool;
 use model::resource_pool::ResourcePoolError;
 use model::resource_pool::common::{CommonPools, LOOPBACK_IP_V6};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
-use sqlx::{FromRow, PgConnection, Pool, Postgres, Row};
+use sqlx::{FromRow, PgConnection, PgTransaction, Pool, Postgres, Row};
 
 use super::{DatabaseError, ObjectFilter, Transaction, queries};
-use crate::DatabaseResult;
 use crate::db_read::DbReader;
+use crate::{ConditionalWrite, ControllerStateNotCurrent, DatabaseResult};
 
 #[derive(Serialize)]
 struct ReprovisionRequestRestart {
@@ -79,11 +87,73 @@ lazy_static! {
         "SELECT row_to_json(m.*) FROM ({}) m INNER JOIN machines ON machines.id = m.id",
         queries::MACHINE_SNAPSHOTS_WITH_HISTORY.as_str(),
     );
+    /// Filters appended to this query must constrain `m.id` directly or through an id
+    /// array such as `m.id = ANY(ARRAY(SELECT ...))`. A filter joined through another
+    /// table is planned after the fleet-wide enrichment once the FROM list exceeds
+    /// `join_collapse_limit`.
     pub static ref JSON_MACHINE_SNAPSHOT_QUERY: String = format!(
         "SELECT row_to_json(m.*) FROM ({}) m INNER JOIN machines ON machines.id = m.id",
         queries::MACHINE_SNAPSHOTS_NO_HISTORY.as_str(),
     );
 }
+
+/// An item associated with a row in `machines`.
+pub trait MachineRowLockItem {
+    /// Returns the ID used to order machine-row lock acquisition.
+    fn machine_id(&self) -> MachineId;
+}
+
+impl MachineRowLockItem for MachineId {
+    fn machine_id(&self) -> MachineId {
+        *self
+    }
+}
+
+impl<T> MachineRowLockItem for (MachineId, T) {
+    fn machine_id(&self) -> MachineId {
+        self.0
+    }
+}
+
+/// An owning iterator in canonical `machines` row-lock acquisition order.
+///
+/// PostgreSQL holds row locks acquired by `UPDATE` until the transaction ends.
+/// If two transactions update overlapping machine batches in different orders,
+/// each can hold a row needed by the other, and PostgreSQL aborts one with
+/// SQLSTATE 40P01 (`deadlock_detected`). A common order prevents that cycle.
+///
+/// Construct this before the batch's first machine-row write so concurrent
+/// transactions acquire row locks in the same order.
+pub struct MachineRowLockOrderIter<T>(std::vec::IntoIter<T>);
+
+impl<T: MachineRowLockItem> MachineRowLockOrderIter<T> {
+    /// Orders machine-scoped batch items by their machine IDs.
+    pub fn new(mut items: Vec<T>) -> Self {
+        items.sort_unstable_by_key(MachineRowLockItem::machine_id);
+        Self(items.into_iter())
+    }
+}
+
+impl<T> MachineRowLockOrderIter<T> {
+    /// Returns the remaining ordered items as a slice.
+    pub fn as_slice(&self) -> &[T] {
+        self.0.as_slice()
+    }
+}
+
+impl<T> Iterator for MachineRowLockOrderIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for MachineRowLockOrderIter<T> {}
 
 /// Load a Machine object matching an interface, creating it if not already present.
 /// Returns a tuple of (Machine, bool did_we_just_create_it)
@@ -97,7 +167,7 @@ pub async fn get_or_create(
     common_pools: Option<&CommonPools>,
     stable_machine_id: &MachineId,
     interface: &MachineInterfaceSnapshot,
-) -> DatabaseResult<Machine> {
+) -> DatabaseResult<AnyMachine> {
     let existing_machine =
         find_one(&mut *txn, stable_machine_id, MachineSearchConfig::default()).await?;
     if let Some(machine_id) = interface.machine_id.as_ref() {
@@ -155,14 +225,86 @@ pub async fn get_or_create(
     }
 }
 
-pub async fn find_one(
+pub async fn find_one<ID>(
     txn: impl DbReader<'_>,
-    id: &MachineId,
+    id: &ID,
     search_config: MachineSearchConfig,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<Machine<ID>>, DatabaseError>
+where
+    ID: MachineIdSubtypeTrait,
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     Ok(find(txn, ObjectFilter::One(*id), search_config)
         .await?
         .pop())
+}
+
+/// `find_dpu_id` returns the requested DPU's ID, or `None` if its row is absent.
+/// Other snapshot fields are neither read nor decoded.
+pub async fn find_dpu_id(
+    conn: impl DbReader<'_>,
+    id: &DpuMachineId,
+) -> DatabaseResult<Option<DpuMachineId>> {
+    let query = "SELECT id FROM machines WHERE id = $1";
+    sqlx::query_scalar(query)
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+pub(crate) async fn find_by_nic_firmware_profile(
+    db: impl DbReader<'_>,
+    profile_id: &NicFirmwareProfileId,
+) -> DatabaseResult<Vec<HostMachine>> {
+    let query = format!(
+        "{} WHERE m.id = ANY(ARRAY(\
+            SELECT id FROM machines WHERE nic_firmware_profile_id = $1 \
+            UNION \
+            SELECT machine_id FROM machine_nic_firmware_overrides WHERE profile_id = $1\
+        ))",
+        JSON_MACHINE_SNAPSHOT_QUERY.as_str()
+    );
+    let machines: Vec<AnyMachine> = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(profile_id)
+        .fetch_all(db)
+        .await
+        .map_err(|error| DatabaseError::query(&query, error))?;
+    machines
+        .into_iter()
+        .map(|machine| machine.try_into_subtype().map_err(Into::into))
+        .collect()
+}
+
+/// Lock the machine row before reading its mutable request state. A separate
+/// read after this query sees changes committed by the previous lock holder.
+pub async fn lock_by_id_for_update(
+    txn: &mut PgConnection,
+    id: &MachineId,
+) -> Result<(), DatabaseError> {
+    let query = "SELECT id FROM machines WHERE id = $1 FOR UPDATE";
+    sqlx::query_scalar::<_, MachineId>(query)
+        .bind(id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(())
+}
+
+/// Locks a machine without waiting for another writer. Returns false when the
+/// row is absent or locked; the caller must release any locks it already holds.
+pub async fn try_lock_by_id_for_update(
+    txn: &mut PgConnection,
+    id: &MachineId,
+) -> Result<bool, DatabaseError> {
+    let query = "SELECT id FROM machines WHERE id = $1 FOR UPDATE SKIP LOCKED";
+    sqlx::query_scalar::<_, MachineId>(query)
+        .bind(id)
+        .fetch_optional(txn)
+        .await
+        .map(|id| id.is_some())
+        .map_err(|error| DatabaseError::query(query, error))
 }
 
 pub async fn find_existing_machine(
@@ -229,8 +371,8 @@ pub async fn find_existing_machine(
 /// * `txn` - A reference to a currently open database transaction
 /// * `state` - A reference to a MachineState enum
 // TODO: abhi, Make it private.
-pub async fn advance(
-    machine: &Machine,
+pub async fn advance<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
     state: &ManagedHostState,
     version: Option<ConfigVersion>,
@@ -269,11 +411,16 @@ pub async fn advance(
 /// * `filter`        - An ObjectFilter to control the size of the response set
 /// * `search_config` - A MachineSearchConfig with search options to control the
 ///   records selected
-pub async fn find(
+pub async fn find<ID>(
     txn: impl DbReader<'_>,
-    filter: ObjectFilter<'_, MachineId>,
+    filter: ObjectFilter<'_, ID>,
     search_config: MachineSearchConfig,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<Machine<ID>>, DatabaseError>
+where
+    ID: MachineIdSubtypeTrait,
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     // The TRUE will be optimized away by the query planner,
     // but it simplifies the rest of the building for us.
     lazy_static! {
@@ -333,26 +480,31 @@ pub async fn find(
         builder.push(" FOR UPDATE OF machines ");
     };
 
-    let all_machines: Vec<Machine> = builder
+    let all_machines: Vec<AnyMachine> = builder
         .build_query_as()
         .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::query(builder.sql(), e))?;
 
-    Ok(all_machines)
+    Ok(all_machines
+        .into_iter()
+        .map(AnyMachine::try_into_subtype)
+        .collect::<Result<Vec<Machine<_>>, _>>()?)
 }
 
 pub async fn find_by_ip(
     txn: &mut PgConnection,
     ip: &IpAddr,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{}
-                INNER JOIN machine_interfaces mi ON mi.machine_id = m.id
-                INNER JOIN machine_interface_addresses mia on mia.interface_id=mi.id
-                WHERE mia.address = $1::inet
-                AND mi.interface_type != 'Bmc'"#,
+                WHERE m.id = ANY(ARRAY(
+                    SELECT mi.machine_id FROM machine_interfaces mi
+                    INNER JOIN machine_interface_addresses mia ON mia.interface_id = mi.id
+                    WHERE mia.address = $1::inet
+                    AND mi.interface_type != 'Bmc'
+                    AND mi.machine_id IS NOT NULL))"#,
             JSON_MACHINE_SNAPSHOT_QUERY.deref()
         );
     }
@@ -433,7 +585,7 @@ pub async fn find_ids_by_instance_type_id(
     txn: &mut PgConnection,
     instance_type_id: &InstanceTypeId,
     for_update: bool,
-) -> Result<Vec<(MachineId, ConfigVersion)>, DatabaseError> {
+) -> Result<Vec<(HostMachineId, ConfigVersion)>, DatabaseError> {
     let mut builder = sqlx::QueryBuilder::new("SELECT id, version FROM machines WHERE");
 
     builder.push(" instance_type_id = ");
@@ -458,8 +610,8 @@ pub async fn find_ids_by_instance_type_id(
 /// * `machine_ids` - A slice of machine IDs to query for
 pub async fn find_nvlink_info_by_machine_ids(
     txn: &mut PgConnection,
-    machine_ids: &[MachineId],
-) -> Result<HashMap<MachineId, Option<MachineNvLinkInfo>>, DatabaseError> {
+    machine_ids: &[HostMachineId],
+) -> Result<HashMap<HostMachineId, Option<MachineNvLinkInfo>>, DatabaseError> {
     if machine_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -475,7 +627,8 @@ pub async fn find_nvlink_info_by_machine_ids(
 
     let mut result = HashMap::new();
     for row in rows {
-        let machine_id: MachineId = row.try_get(0).map_err(|e| DatabaseError::query(query, e))?;
+        let machine_id: HostMachineId =
+            row.try_get(0).map_err(|e| DatabaseError::query(query, e))?;
         let nvlink_info: Option<sqlx::types::Json<MachineNvLinkInfo>> =
             row.try_get(1).map_err(|e| DatabaseError::query(query, e))?;
         let nvlink_info = nvlink_info.map(|json| json.0);
@@ -488,7 +641,7 @@ pub async fn find_nvlink_info_by_machine_ids(
 async fn update_machine_instance_type(
     txn: &mut PgConnection,
     instance_type_id: Option<&InstanceTypeId>,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     if machine_versions.is_empty() {
         return Ok(vec![]);
@@ -529,7 +682,7 @@ async fn update_machine_instance_type(
 pub async fn associate_machines_with_instance_type(
     txn: &mut PgConnection,
     instance_type_id: &InstanceTypeId,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     update_machine_instance_type(txn, Some(instance_type_id), machine_versions).await
 }
@@ -541,7 +694,7 @@ pub async fn associate_machines_with_instance_type(
 /// * `machine_ids` - A slice of machine IDs to update
 pub async fn remove_instance_type_associations(
     txn: &mut PgConnection,
-    machine_versions: &[(&MachineId, &ConfigVersion)],
+    machine_versions: &[(&HostMachineId, &ConfigVersion)],
 ) -> Result<Vec<MachineId>, DatabaseError> {
     update_machine_instance_type(txn, None, machine_versions).await
 }
@@ -549,10 +702,10 @@ pub async fn remove_instance_type_associations(
 pub async fn find_by_hostname(
     txn: &mut PgConnection,
     hostname: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
-            "{} JOIN machine_interfaces mi ON m.id = mi.machine_id WHERE mi.hostname = $1 AND mi.interface_type != 'Bmc'",
+            "{} WHERE m.id = ANY(ARRAY(SELECT mi.machine_id FROM machine_interfaces mi WHERE mi.hostname = $1 AND mi.interface_type != 'Bmc' AND mi.machine_id IS NOT NULL))",
             JSON_MACHINE_SNAPSHOT_QUERY.deref()
         );
     }
@@ -569,10 +722,10 @@ pub async fn find_by_hostname(
 pub async fn find_by_mac_address(
     txn: &mut PgConnection,
     mac_address: &MacAddress,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
-            "{} JOIN machine_interfaces mi ON m.id = mi.machine_id WHERE mi.mac_address = $1::macaddr AND mi.interface_type != 'Bmc'",
+            "{} WHERE m.id = ANY(ARRAY(SELECT mi.machine_id FROM machine_interfaces mi WHERE mi.mac_address = $1::macaddr AND mi.interface_type != 'Bmc' AND mi.machine_id IS NOT NULL))",
             JSON_MACHINE_SNAPSHOT_QUERY.deref()
         );
     }
@@ -585,18 +738,21 @@ pub async fn find_by_mac_address(
     Ok(machine)
 }
 
+/// Finds the machine with this address in either loopback field.
+/// Both fields are serialized from typed IP addresses, so their stored text
+/// matches `IpAddr::to_string()`.
 pub async fn find_by_loopback_ip(
     txn: impl DbReader<'_>,
-    loopback_ip: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+    loopback_ip: IpAddr,
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
-            "{} WHERE m.network_config->>'loopback_ip' = $1",
+            "{} WHERE m.network_config->>'loopback_ip' = $1 OR m.network_config->>'loopback_ip_v6' = $1",
             JSON_MACHINE_SNAPSHOT_QUERY.deref()
         );
     }
     let machine = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
-        .bind(loopback_ip)
+        .bind(loopback_ip.to_string())
         .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::query(query.as_str(), e))?;
@@ -612,7 +768,7 @@ pub async fn find_by_loopback_ip(
 pub async fn find_by_query(
     txn: &mut PgConnection,
     query: &str,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     if let Ok(id) = MachineId::from_str(query) {
         return find_one(txn, &id, MachineSearchConfig::default()).await;
     }
@@ -628,11 +784,15 @@ pub async fn find_by_query(
     find_by_hostname(txn, query).await
 }
 
-pub async fn update_reboot_time(
-    machine: &Machine,
+/// Records the database statement execution time as the machine's reboot timestamp.
+///
+/// This ensures a reboot reported after a concurrent state transition is recorded as newer than
+/// that transition, even when the reporting transaction began first.
+pub async fn update_reboot_time<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let query = "UPDATE machines SET last_reboot_time=NOW() WHERE id=$1 RETURNING id";
+    let query = "UPDATE machines SET last_reboot_time=clock_timestamp() WHERE id=$1 RETURNING id";
     let _id = sqlx::query_as::<_, MachineId>(query)
         .bind(machine.id.to_string())
         .fetch_one(txn)
@@ -641,6 +801,9 @@ pub async fn update_reboot_time(
     Ok(())
 }
 
+/// Records a new reboot or power request at the supplied time.
+/// Reboots start unverified; other modes skip restart verification. The
+/// verification attempt count starts at zero in either case.
 pub async fn update_reboot_requested_explicit_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
@@ -658,9 +821,20 @@ pub async fn update_reboot_requested_explicit_time(
         verification_attempts: Some(0),
     };
 
+    record_reboot_request(machine_id, txn, &data).await
+}
+
+/// Records a new reboot or power request, replacing the previous record in full.
+/// The caller supplies its timestamp, mode, and initial verification state.
+/// Use `update_restart_verification_status` to verify an existing attempt.
+pub async fn record_reboot_request(
+    machine_id: &MachineId,
+    txn: &mut PgConnection,
+    request: &MachineLastRebootRequested,
+) -> Result<(), DatabaseError> {
     let query = "UPDATE machines SET last_reboot_requested=$1 WHERE id=$2 RETURNING id";
     let _id = sqlx::query_as::<_, MachineId>(query)
-        .bind(sqlx::types::Json(&data))
+        .bind(sqlx::types::Json(request))
         .bind(machine_id)
         .fetch_one(txn)
         .await
@@ -676,32 +850,60 @@ pub async fn update_reboot_requested_time(
     update_reboot_requested_explicit_time(machine_id, txn, mode, Utc::now()).await
 }
 
+/// The captured reboot record no longer matches, or the machine or request is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebootVerificationNotCurrent;
+
+/// Updates verification only while every field of the captured request still matches.
+///
+/// Compares the record under a machine-row lock held until the caller's
+/// transaction ends. Only verification status and attempt count are changed.
+/// Missing machines, absent requests, and changed records share
+/// `NotApplied(RebootVerificationNotCurrent)`.
 pub async fn update_restart_verification_status(
     machine_id: &MachineId,
-    mut current_reboot: MachineLastRebootRequested,
+    current_reboot: MachineLastRebootRequested,
     verified: Option<bool>,
     attempts: i32,
-    txn: &mut PgConnection,
-) -> Result<(), DatabaseError> {
-    current_reboot.restart_verified = verified;
-    current_reboot.verification_attempts = Some(attempts);
+    txn: &mut PgTransaction<'_>,
+) -> Result<ConditionalWrite<(), RebootVerificationNotCurrent>, DatabaseError> {
+    let query = "SELECT last_reboot_requested FROM machines WHERE id=$1 FOR NO KEY UPDATE";
+    let stored: Option<Option<sqlx::types::Json<MachineLastRebootRequested>>> =
+        sqlx::query_scalar(query)
+            .bind(machine_id)
+            .fetch_optional(txn.as_mut())
+            .await
+            .map_err(|e| DatabaseError::query(query, e))?;
+    let Some(sqlx::types::Json(stored_reboot)) = stored.flatten() else {
+        return Ok(ConditionalWrite::NotApplied(RebootVerificationNotCurrent));
+    };
 
-    let query = "UPDATE machines SET last_reboot_requested=$1 WHERE id=$2 RETURNING id";
+    // Compare typed values: legacy JSON can spell UTC as `+00:00` and omit
+    // optional fields. A SQL timestamp cast would also lose nanoseconds.
+    if stored_reboot != current_reboot {
+        return Ok(ConditionalWrite::NotApplied(RebootVerificationNotCurrent));
+    }
+
+    let query = "UPDATE machines
+                 SET last_reboot_requested = last_reboot_requested || jsonb_build_object(
+                     'restart_verified', $1::boolean, 'verification_attempts', $2::integer)
+                 WHERE id=$3 RETURNING id";
     let _id = sqlx::query_as::<_, MachineId>(query)
-        .bind(sqlx::types::Json(&current_reboot))
+        .bind(verified)
+        .bind(attempts)
         .bind(machine_id)
-        .fetch_one(txn)
+        .fetch_one(txn.as_mut())
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
-    Ok(())
+    Ok(ConditionalWrite::Applied(()))
 }
 
 /// Records the database statement execution time as the machine's cleanup timestamp.
 ///
 /// This ensures cleanup completed after a concurrent state transition is recorded as newer than
 /// that transition, even when the cleanup transaction began first.
-pub async fn update_cleanup_time(
-    machine: &Machine,
+pub async fn update_cleanup_time<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     // A cleanup transaction can begin before a concurrent state transition commits. Record the
@@ -773,11 +975,16 @@ pub async fn clear_bios_password_set_time(
         .map_err(|e| DatabaseError::query(query, e))
 }
 
+/// Records the database statement execution time as the machine's discovery timestamp.
+///
+/// This ensures discovery completed after a concurrent state transition is recorded as newer than
+/// that transition, even when the discovery transaction began first.
 pub async fn update_discovery_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let query = "UPDATE machines SET last_discovery_time=NOW() WHERE id=$1 RETURNING id";
+    let query =
+        "UPDATE machines SET last_discovery_time=clock_timestamp() WHERE id=$1 RETURNING id";
     let _id = sqlx::query_as::<_, MachineId>(query)
         .bind(machine_id)
         .fetch_one(txn)
@@ -817,14 +1024,15 @@ pub async fn update_last_scout_observed_version(
 
 pub async fn find_host_by_dpu_machine_id(
     txn: &mut PgConnection,
-    dpu_machine_id: &MachineId,
-) -> Result<Option<Machine>, DatabaseError> {
+    dpu_machine_id: &DpuMachineId,
+) -> Result<Option<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
-            r#"{} INNER JOIN machine_interfaces mi ON m.id = mi.machine_id
-                    WHERE mi.attached_dpu_machine_id=$1
+            r#"{} WHERE m.id = ANY(ARRAY(
+                    SELECT mi.machine_id FROM machine_interfaces mi
+                    WHERE mi.attached_dpu_machine_id = $1
                     AND mi.interface_type != 'Bmc'
-                    AND mi.attached_dpu_machine_id != mi.machine_id"#,
+                    AND mi.attached_dpu_machine_id != mi.machine_id))"#,
             JSON_MACHINE_SNAPSHOT_QUERY.deref()
         );
     }
@@ -837,17 +1045,46 @@ pub async fn find_host_by_dpu_machine_id(
     Ok(machine)
 }
 
+/// `lookup_host_state_by_dpu_machine_id` returns the associated host's state
+/// by reading only `id` and `controller_state` through a non-BMC interface
+/// owned by a machine other than the requested DPU.
+///
+/// The owner must have a stable or predicted [`HostMachineId`]. Invalid IDs
+/// or state data return decoding errors; no matching association returns `None`.
+/// Selection is unspecified when multiple hosts match. Other snapshot fields
+/// are neither read nor decoded; use [`find_host_by_dpu_machine_id`] for those.
+pub async fn lookup_host_state_by_dpu_machine_id(
+    conn: impl DbReader<'_>,
+    dpu_machine_id: &DpuMachineId,
+) -> DatabaseResult<Option<ManagedHostState>> {
+    let query = r#"SELECT m.id, m.controller_state
+        FROM machines m
+        INNER JOIN machine_interfaces mi ON m.id = mi.machine_id
+        WHERE mi.attached_dpu_machine_id = $1
+          AND mi.interface_type != 'Bmc'
+          AND mi.attached_dpu_machine_id != mi.machine_id
+        LIMIT 1"#;
+
+    let host: Option<(HostMachineId, sqlx::types::Json<ManagedHostState>)> = sqlx::query_as(query)
+        .bind(dpu_machine_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(host.map(|(_, state)| state.0))
+}
+
 pub async fn lookup_host_machine_ids_by_dpu_ids(
     conn: impl DbReader<'_>,
-    dpu_machine_ids: &[MachineId],
-) -> Result<HashMap<MachineId, HostMachineId>, DatabaseError> {
+    dpu_machine_ids: &[DpuMachineId],
+) -> Result<HashMap<DpuMachineId, HostMachineId>, DatabaseError> {
     let query = r#"SELECT mi.attached_dpu_machine_id, mi.machine_id
         FROM machine_interfaces mi
         WHERE mi.attached_dpu_machine_id != mi.machine_id
         AND mi.interface_type != 'Bmc'
         AND mi.attached_dpu_machine_id = ANY($1)"#;
 
-    let dpu_id_host_id_pairs: Vec<(MachineId, HostMachineId)> = sqlx::query_as(query)
+    let dpu_id_host_id_pairs: Vec<(DpuMachineId, HostMachineId)> = sqlx::query_as(query)
         .bind(
             dpu_machine_ids
                 .iter()
@@ -900,25 +1137,32 @@ pub async fn get_host_use_admin_network_for_dpa_interface(
     Ok(flag.unwrap_or(true))
 }
 
+lazy_static! {
+    static ref FIND_DPUS_BY_HOST_MACHINE_ID_QUERY: String = format!(
+        r#"{}
+                WHERE m.id = ANY(ARRAY(
+                    SELECT mi.attached_dpu_machine_id FROM machine_interfaces mi
+                    WHERE mi.machine_id = $1
+                    AND mi.interface_type != 'Bmc'
+                    AND mi.attached_dpu_machine_id IS NOT NULL))"#,
+        JSON_MACHINE_SNAPSHOT_QUERY.deref()
+    );
+}
+
+/// Load the DPUs attached to a host through any non-BMC host interface.
+///
+/// Each attached DPU is returned once, even when several host interfaces
+/// attach to it.
 pub async fn find_dpus_by_host_machine_id(
     txn: &mut PgConnection,
-    host_machine_id: &MachineId,
-) -> Result<Vec<Machine>, DatabaseError> {
-    lazy_static! {
-        static ref query: String = format!(
-            r#"{}
-                    INNER JOIN machine_interfaces mi
-                      ON m.id = mi.attached_dpu_machine_id
-                    WHERE mi.machine_id=$1
-                    AND mi.interface_type != 'Bmc'"#,
-            JSON_MACHINE_SNAPSHOT_QUERY.deref()
-        );
-    }
-    let machines = sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+    host_machine_id: &HostMachineId,
+) -> Result<Vec<DpuMachine>, DatabaseError> {
+    let query = FIND_DPUS_BY_HOST_MACHINE_ID_QUERY.as_str();
+    let machines = sqlx::query_as(sqlx::AssertSqlSafe(query))
         .bind(host_machine_id)
         .fetch_all(txn)
         .await
-        .map_err(|e| DatabaseError::query(query.as_str(), e))?;
+        .map_err(|e| DatabaseError::query(query, e))?;
 
     Ok(machines)
 }
@@ -957,44 +1201,61 @@ pub async fn update_metadata(
     }
 }
 
-/// Only does the update if the passed observation is newer than any existing one
+/// `MachineObservationNotCurrent` means the machine is missing or its stored
+/// observation no longer satisfies the timestamp condition. The write does not
+/// distinguish those cases. Converting this reason to [`DatabaseError`] wraps
+/// `sqlx::Error::RowNotFound` for callers that require the observation to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineObservationNotCurrent;
+
+impl From<MachineObservationNotCurrent> for DatabaseError {
+    #[track_caller]
+    fn from(_: MachineObservationNotCurrent) -> Self {
+        Self::new(
+            "update machine status observation",
+            sqlx::Error::RowNotFound,
+        )
+    }
+}
+
+/// Stores a network observation when its timestamp is at least as recent as the
+/// stored one, or no timestamp is stored. Compares both JSON timestamps at
+/// PostgreSQL's microsecond precision. Returns `NotApplied` for a missing
+/// machine or rejected timestamp.
 pub async fn update_network_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     observation: &MachineNetworkStatusObservation,
-) -> Result<(), DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineObservationNotCurrent>, DatabaseError> {
+    // Parse both timestamps from JSON so they round alike. SQLx truncates
+    // separately bound timestamps to microseconds.
     let query = "UPDATE machines SET network_status_observation = $1::json WHERE id = $2 AND
                 (
                     (network_status_observation->>'observed_at' IS NULL)
-                    OR ((network_status_observation->>'observed_at')::timestamp <= $3::timestamp)
+                    OR ((network_status_observation->>'observed_at')::timestamp
+                        <= ($1::json->>'observed_at')::timestamp)
                 ) RETURNING id";
-    let _id: (MachineId,) = match sqlx::query_as(query)
+    let updated: Option<(MachineId,)> = sqlx::query_as(query)
         .bind(sqlx::types::Json(&observation))
         .bind(machine_id)
-        .bind(observation.observed_at)
-        .fetch_one(&mut *txn)
+        .fetch_optional(&mut *txn)
         .await
-        .map_err(|e| DatabaseError::query(query, e))
-    {
-        Ok(result) => result,
-        Err(e) if e.is_not_found() => {
-            // This function is intended to be able to capture why the update sometimes fails in unit-test
-            // even though all prerequisite data is present.
-            // It compiles to a no-op in production environments.
-            debug_failed_machine_status_update(
-                txn,
-                machine_id,
-                "network_status_observation",
-                observation,
-            )
-            .await;
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
+        .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(())
+    if updated.is_some() {
+        return Ok(ConditionalWrite::Applied(()));
+    }
+
+    debug_failed_machine_status_update(txn, machine_id, "network_status_observation", observation)
+        .await;
+    Ok(ConditionalWrite::NotApplied(MachineObservationNotCurrent))
 }
+
+/// `ExtensionServiceObservationNotCurrent` means the conditional observation
+/// update did not match, but the machine was present when rechecked. The
+/// rejected observation does not replace the stored service entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionServiceObservationNotCurrent;
 
 /// Updates the current extension-service observation for one service type.
 ///
@@ -1003,16 +1264,19 @@ pub async fn update_network_status_observation(
 /// is a single JSONB update: PostgreSQL serializes concurrent row updates and
 /// `jsonb_set` retains every other service-type entry.
 ///
-/// Returns `false` when the machine exists but a newer observation for this
-/// same service type is already present, and [`DatabaseError::NotFoundError`]
-/// when the machine row is absent, so a superseded report is distinguishable
-/// from a machine that went away.
+/// Compares the stored and incoming JSON timestamps at PostgreSQL's microsecond
+/// precision, accepting equal timestamps and newer observations.
+///
+/// Returns `Applied(())` when the observation is stored. A conditional miss
+/// returns `NotApplied` if the machine exists when rechecked, or
+/// [`DatabaseError::NotFoundError`] if it is absent. The identity recheck is
+/// a separate read, not part of the timestamp comparison's snapshot.
 pub async fn update_extension_service_status_observation(
     txn: &mut PgConnection,
     machine_id: &MachineId,
     service_type: ExtensionServiceType,
     observation: &InstanceExtensionServiceStatusObservation,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), ExtensionServiceObservationNotCurrent>, DatabaseError> {
     let query = r#"
         UPDATE machines
         SET extension_service_status_observations = jsonb_set(
@@ -1025,7 +1289,7 @@ pub async fn update_extension_service_status_observation(
           AND (
               extension_service_status_observations -> $2 IS NULL
               OR (extension_service_status_observations -> $2 ->> 'observed_at')::timestamptz
-                    <= $4::timestamptz
+                    <= ($3::jsonb->>'observed_at')::timestamptz
           )
         RETURNING id
     "#;
@@ -1033,12 +1297,11 @@ pub async fn update_extension_service_status_observation(
         .bind(machine_id)
         .bind(service_type.to_string())
         .bind(sqlx::types::Json(observation))
-        .bind(observation.observed_at)
         .fetch_optional(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
     if updated.is_some() {
-        return Ok(true);
+        return Ok(ConditionalWrite::Applied(()));
     }
 
     // The update above matches on machine identity and observation freshness
@@ -1051,7 +1314,9 @@ pub async fn update_extension_service_status_observation(
         .await
         .map_err(|e| DatabaseError::query(identity_query, e))?;
     if machine_exists.is_some() {
-        return Ok(false);
+        return Ok(ConditionalWrite::NotApplied(
+            ExtensionServiceObservationNotCurrent,
+        ));
     }
 
     // Captures why the update failed in unit tests even though all prerequisite
@@ -1069,58 +1334,74 @@ pub async fn update_extension_service_status_observation(
     })
 }
 
-/// Only does the update if the passed observation is newer than any existing one
+/// Stores an InfiniBand observation when none is stored or its timestamp is at
+/// least as recent, comparing both JSON timestamps at PostgreSQL's microsecond
+/// precision. A missing machine or an unmet condition returns `NotApplied`.
 pub async fn update_infiniband_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     observation: &MachineInfinibandStatusObservation,
-) -> Result<(), DatabaseError> {
-    let query =
-            "UPDATE machines SET infiniband_status_observation = $1::json WHERE id = $2 AND
+) -> Result<ConditionalWrite<(), MachineObservationNotCurrent>, DatabaseError> {
+    let query = "UPDATE machines SET infiniband_status_observation = $1::json WHERE id = $2 AND
              (infiniband_status_observation IS NULL
-                OR (infiniband_status_observation ? 'observed_at' AND infiniband_status_observation->>'observed_at' <= $3)
+                OR (infiniband_status_observation ? 'observed_at'
+                    AND (infiniband_status_observation->>'observed_at')::timestamptz
+                        <= ($1::json->>'observed_at')::timestamptz)
             ) RETURNING id";
-    let _id: (MachineId,) = sqlx::query_as(query)
+    let updated: Option<(MachineId,)> = sqlx::query_as(query)
         .bind(sqlx::types::Json(&observation))
         .bind(machine_id)
-        .bind(observation.observed_at.to_rfc3339())
-        .fetch_one(txn)
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(())
+    Ok(match updated {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(MachineObservationNotCurrent),
+    })
 }
 
+/// Stores an NVLink observation when no timestamp is stored or its timestamp is
+/// at least as recent, comparing both JSON timestamps at PostgreSQL's
+/// microsecond precision. A missing machine or an unmet condition returns
+/// `NotApplied`.
 pub async fn update_nvlink_status_observation(
     txn: &mut PgConnection,
     machine_id: &MachineId,
     observation: &MachineNvLinkStatusObservation,
-) -> Result<(), DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineObservationNotCurrent>, DatabaseError> {
     let query = "UPDATE machines SET nvlink_status_observation = $1::json WHERE id = $2 AND
-                (nvlink_status_observation->>'observed_at' IS NULL OR nvlink_status_observation->>'observed_at' <= $3) RETURNING id";
-    let _id: (MachineId,) = sqlx::query_as(query)
+                (nvlink_status_observation->>'observed_at' IS NULL
+                    OR (nvlink_status_observation->>'observed_at')::timestamptz
+                        <= ($1::json->>'observed_at')::timestamptz) RETURNING id";
+    let updated: Option<(MachineId,)> = sqlx::query_as(query)
         .bind(sqlx::types::Json(&observation))
         .bind(machine_id)
-        .bind(observation.observed_at.to_rfc3339())
-        .fetch_one(txn)
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(())
+    Ok(match updated {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(MachineObservationNotCurrent),
+    })
 }
 
 /// Clears `machines.nvlink_status_observation` for the given machine IDs.
 ///
-/// Used when NMX-C is unreachable so instance state does not retain stale partition observations.
+/// Used when NMX-C is unreachable so instance state does not retain stale
+/// partition observations. Rows already holding NULL are not written, so the
+/// `updated` trigger does not fire for them.
 pub async fn clear_nvlink_status_observations(
     txn: &mut PgConnection,
-    machine_ids: &[MachineId],
+    machine_ids: &[HostMachineId],
 ) -> Result<(), DatabaseError> {
     if machine_ids.is_empty() {
         return Ok(());
     }
 
-    let query = "UPDATE machines SET nvlink_status_observation = NULL WHERE id = ANY($1)";
+    let query = "UPDATE machines SET nvlink_status_observation = NULL
+                 WHERE id = ANY($1) AND nvlink_status_observation IS NOT NULL";
     let machine_id_strings: Vec<String> = machine_ids.iter().map(|id| id.to_string()).collect();
     sqlx::query(query)
         .bind(machine_id_strings)
@@ -1131,26 +1412,136 @@ pub async fn clear_nvlink_status_observations(
     Ok(())
 }
 
+/// Stores a Spectrum-X observation when no timestamp is stored or its timestamp
+/// is at least as recent, comparing both JSON timestamps at PostgreSQL's
+/// microsecond precision. A missing machine or an unmet condition returns
+/// `NotApplied`.
 pub async fn update_spx_status_observation(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     observation: &MachineSpxStatusObservation,
-) -> Result<(), DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineObservationNotCurrent>, DatabaseError> {
     tracing::debug!(
         observation = ?observation,
         "updating SPX status observation",
     );
     let query = "UPDATE machines SET spx_status_observation = $1::json WHERE id = $2 AND
-                (spx_status_observation->>'observed_at' IS NULL OR spx_status_observation->>'observed_at' <= $3) RETURNING id";
-    let _id: (MachineId,) = sqlx::query_as(query)
+                (spx_status_observation->>'observed_at' IS NULL
+                    OR (spx_status_observation->>'observed_at')::timestamptz
+                        <= ($1::json->>'observed_at')::timestamptz) RETURNING id";
+    let updated: Option<(MachineId,)> = sqlx::query_as(query)
         .bind(sqlx::types::Json(&observation))
         .bind(machine_id)
-        .bind(observation.observed_at.to_rfc3339())
-        .fetch_one(txn)
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
+    Ok(match updated {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(MachineObservationNotCurrent),
+    })
+}
+
+/// Lock the host row and read its current maintenance requests. Keep the
+/// transaction open until the dependent update is committed.
+pub async fn lock_spx_multiplane(
+    txn: &mut PgConnection,
+    machine_id: &HostMachineId,
+) -> DatabaseResult<Option<MachineSpxMultiplane>> {
+    let query = "SELECT spx_multiplane FROM machines WHERE id=$1 FOR UPDATE";
+    let configuration: Option<Option<sqlx::types::Json<MachineSpxMultiplane>>> =
+        sqlx::query_scalar(query)
+            .bind(machine_id)
+            .fetch_optional(txn)
+            .await
+            .map_err(|error| DatabaseError::query(query, error))?;
+    configuration
+        .map(|value| value.map(|json| json.0))
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "machine",
+            id: machine_id.to_string(),
+        })
+}
+
+/// Replace maintenance state while holding the lock acquired by
+/// `lock_spx_multiplane` in the same transaction.
+pub async fn update_spx_multiplane(
+    txn: &mut PgConnection,
+    machine_id: &HostMachineId,
+    configuration: &MachineSpxMultiplane,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET spx_multiplane=$1 WHERE id=$2";
+    sqlx::query(query)
+        .bind(sqlx::types::Json(configuration))
+        .bind(machine_id)
+        .execute(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
     Ok(())
+}
+
+/// Lock the reporting DPU row before merging a partial maintenance report.
+/// Callers lock the host configuration first to serialize reports against desired revisions.
+pub async fn lock_spx_multiplane_status(
+    txn: &mut PgConnection,
+    dpu_machine_id: &DpuMachineId,
+) -> DatabaseResult<Option<MachineSpxMultiplaneStatus>> {
+    let query = "SELECT spx_multiplane_status FROM machines WHERE id=$1 FOR UPDATE";
+    let status: Option<Option<sqlx::types::Json<MachineSpxMultiplaneStatus>>> =
+        sqlx::query_scalar(query)
+            .bind(dpu_machine_id)
+            .fetch_optional(txn)
+            .await
+            .map_err(|error| DatabaseError::query(query, error))?;
+    status
+        .map(|value| value.map(|json| json.0))
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "machine",
+            id: dpu_machine_id.to_string(),
+        })
+}
+
+/// Store only the reporting DPU's status while holding its row lock.
+pub async fn update_spx_multiplane_status(
+    txn: &mut PgConnection,
+    dpu_machine_id: &DpuMachineId,
+    status: &MachineSpxMultiplaneStatus,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET spx_multiplane_status=$1 WHERE id=$2";
+    sqlx::query(query)
+        .bind(sqlx::types::Json(status))
+        .bind(dpu_machine_id)
+        .execute(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    Ok(())
+}
+
+/// `update_mlx_device_observation` saves an unfiltered observation if none
+/// exists or the new timestamp is at least as recent. Comparisons use the
+/// database's timestamp precision. Returns `NotApplied` if the machine is
+/// missing or a newer observation is stored. Callers must validate report
+/// ownership and completeness.
+pub async fn update_mlx_device_observation(
+    txn: &mut PgConnection,
+    machine_id: &HostMachineId,
+    observation: &MlxDeviceObservation,
+) -> Result<ConditionalWrite<(), MachineObservationNotCurrent>, DatabaseError> {
+    let query = "UPDATE machines SET mlx_device_observation = $1::json WHERE id = $2 AND
+                (mlx_device_observation IS NULL
+                    OR (mlx_device_observation->>'observed_at')::timestamptz
+                        <= ($1::json->>'observed_at')::timestamptz) RETURNING id";
+    let updated: Option<(MachineId,)> = sqlx::query_as(query)
+        .bind(sqlx::types::Json(observation))
+        .bind(machine_id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(match updated {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(MachineObservationNotCurrent),
+    })
 }
 
 #[cfg(test)]
@@ -1205,7 +1596,7 @@ async fn debug_failed_machine_status_update(
 
 pub async fn update_dpu_agent_health_report(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     health_report: &HealthReport,
 ) -> Result<(), DatabaseError> {
     let mut health_report = health_report.clone();
@@ -1361,7 +1752,7 @@ pub async fn remove_health_report(
 
 pub async fn update_agent_reported_inventory(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     inventory: &MachineInventory,
 ) -> Result<(), DatabaseError> {
     let query =
@@ -1420,6 +1811,12 @@ pub async fn force_cleanup(
     Ok(())
 }
 
+/// `MachineNetworkConfigNotCurrent` means the target is missing or its network
+/// version no longer matches. The guarded backfill also rejects force deletion;
+/// the write deliberately does not distinguish these cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineNetworkConfigNotCurrent;
+
 /// Updates the `network_config` on the target machine row (host or
 /// DPU), and bumps the `network_config_version` on *every* machine
 /// row in the same "machine group" (host + every DPU attached to it)
@@ -1429,12 +1826,16 @@ pub async fn force_cleanup(
 /// computed by the `machine_group_member_ids` Postgres function, which
 /// walks `machine_interfaces`. For zero-DPU hosts, the group is just the
 /// target itself.
+///
+/// Returns `NotApplied(MachineNetworkConfigNotCurrent)` for a missing target or
+/// changed version. Database failures remain errors. The caller must commit
+/// both the target write and group version updates in the same transaction.
 pub async fn try_update_network_config(
     txn: &mut PgConnection,
     machine_id: &MachineId,
     expected_version: ConfigVersion,
     new_state: &ManagedHostNetworkConfig,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineNetworkConfigNotCurrent>, DatabaseError> {
     try_update_network_config_inner(txn, machine_id, expected_version, new_state, false).await
 }
 
@@ -1443,7 +1844,7 @@ async fn try_update_network_config_unless_force_deleting(
     machine_id: &MachineId,
     expected_version: ConfigVersion,
     new_state: &ManagedHostNetworkConfig,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineNetworkConfigNotCurrent>, DatabaseError> {
     try_update_network_config_inner(txn, machine_id, expected_version, new_state, true).await
 }
 
@@ -1467,7 +1868,7 @@ async fn try_update_network_config_inner(
     expected_version: ConfigVersion,
     new_state: &ManagedHostNetworkConfig,
     reject_force_deletion: bool,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), MachineNetworkConfigNotCurrent>, DatabaseError> {
     let next_version = expected_version.increment();
 
     // First, do our usual "optimistic" lock update on the target row, which
@@ -1505,9 +1906,11 @@ async fn try_update_network_config_inner(
                 .execute(&mut *txn)
                 .await
                 .map_err(|e| DatabaseError::query(group_query, e))?;
-            Ok(true)
+            Ok(ConditionalWrite::Applied(()))
         }
-        Err(sqlx::Error::RowNotFound) => Ok(false),
+        Err(sqlx::Error::RowNotFound) => {
+            Ok(ConditionalWrite::NotApplied(MachineNetworkConfigNotCurrent))
+        }
         Err(e) => Err(DatabaseError::query(target_query, e)),
     }
 }
@@ -1516,7 +1919,7 @@ async fn try_update_network_config_inner(
 /// row without bumping `network_config_version` or fanning out to the group.
 pub async fn set_use_admin_network_changed(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     value: bool,
 ) -> Result<(), DatabaseError> {
     let query = r#"
@@ -1539,13 +1942,21 @@ pub async fn set_use_admin_network_changed(
     Ok(())
 }
 
-/// Clears the `use_admin_network_changed` flag only if the machine is still at
-/// the expected network config version.
+/// `AdminNetworkChangeNotPending` means no pending flag matches the acknowledged
+/// version. The machine may be missing, its network config version may differ,
+/// or `use_admin_network_changed` may already be false or unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminNetworkChangeNotPending;
+
+/// Clears the pending `use_admin_network_changed` flag only if the machine is
+/// still at the expected network config version, without advancing that version.
+/// Returns `NotApplied(AdminNetworkChangeNotPending)` when no pending flag matches;
+/// database failures remain errors.
 pub async fn clear_use_admin_network_changed_if_version_matches(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     expected_version: &ConfigVersion,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), AdminNetworkChangeNotPending>, DatabaseError> {
     let query = r#"
         UPDATE machines
         SET network_config = jsonb_set(COALESCE(network_config, '{}'::jsonb), '{use_admin_network_changed}', 'false'::jsonb)
@@ -1560,7 +1971,38 @@ pub async fn clear_use_admin_network_changed_if_version_matches(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    Ok(result.rows_affected() > 0)
+    Ok(if result.rows_affected() > 0 {
+        ConditionalWrite::Applied(())
+    } else {
+        ConditionalWrite::NotApplied(AdminNetworkChangeNotPending)
+    })
+}
+
+/// Locks the interface rows of `predicted_host_id`, ascending by id and BMC
+/// rows included, then its machines row: the order the host's other writers
+/// use. Call it before any other row lock in the transaction, so the FK
+/// cascade of [`try_sync_stable_id_with_current_machine_id_for_host`] finds
+/// the interface rows already held; the rows it cascades into through the
+/// other tables that reference `machines(id)` are ones other flows write only
+/// after locking the machines row. Locks nothing when the host was renamed or
+/// deleted since the caller read its id.
+pub async fn lock_rows_for_stable_id_sync(
+    txn: &mut PgConnection,
+    predicted_host_id: &PredictedHostMachineId,
+) -> DatabaseResult<()> {
+    let query = "SELECT id FROM machine_interfaces WHERE machine_id = $1 ORDER BY id FOR UPDATE";
+    sqlx::query(query)
+        .bind(predicted_host_id)
+        .execute(&mut *txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    let query = "SELECT id FROM machines WHERE id = $1 FOR UPDATE";
+    sqlx::query(query)
+        .bind(predicted_host_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(())
 }
 
 /// Replaces predicted host id with stable host id.
@@ -1568,11 +2010,14 @@ pub async fn clear_use_admin_network_changed_if_version_matches(
 /// This StableMachineId must replace existing PredictedHostId in db.
 /// State machine does not act on receiving discoverydata, but discoverycompleted message,
 /// so updating host id must not interfere state machine handling.
+/// Callers hold the locks from [`lock_rows_for_stable_id_sync`], so the FK
+/// cascade of the rename below finds the host's interface rows already held
+/// and reaches the other referencing tables only after the machines row.
 pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     txn: &mut PgConnection,
-    current_machine_id: &Option<MachineId>,
-    stable_machine_id: &MachineId,
-) -> Result<MachineId, DatabaseError> {
+    current_machine_id: Option<HostMachineId>,
+    stable_machine_id: &StableHostMachineId,
+) -> Result<StableHostMachineId, DatabaseError> {
     let Some(current_machine_id) = current_machine_id else {
         return Err(DatabaseError::NotFoundError {
             kind: "machine_id",
@@ -1581,8 +2026,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     };
 
     // This is repeated call. Machine is already updated with stable ID.
-    if !current_machine_id.machine_type().is_predicted_host() {
-        return match find_one(txn, current_machine_id, MachineSearchConfig::default()).await? {
+    if let Ok(stable_host_id) = StableHostMachineId::try_from(current_machine_id) {
+        return match find_one(txn, &stable_host_id, MachineSearchConfig::default()).await? {
             Some(machine) => Ok(machine.id),
             None => Err(DatabaseError::NotFoundError {
                 kind: "machine",
@@ -1595,8 +2040,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     crate::state_history::update_object_ids(
         txn,
         crate::state_history::StateHistoryTableId::Machine,
-        current_machine_id,
-        stable_machine_id,
+        &current_machine_id,
+        &stable_machine_id,
     )
     .await?;
     crate::health_history::update_object_ids(
@@ -1622,9 +2067,8 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
-    // machine_interfaces and dpa_interfaces both carry a machines(id) FK with
-    // ON UPDATE CASCADE, so their machine_id rows follow this rename
-    // automatically.
+    // Interface and NIC firmware selection rows reference machines(id) with
+    // ON UPDATE CASCADE, so their machine_id follows this rename automatically.
     let query = "UPDATE machines SET id=$1 WHERE id=$2 RETURNING id";
     let machine_id = sqlx::query_as(query)
         .bind(stable_machine_id)
@@ -1652,12 +2096,12 @@ pub async fn try_sync_stable_id_with_current_machine_id_for_host(
     Ok(machine_id)
 }
 
-pub async fn update_failure_details(
-    machine: &Machine,
+pub async fn update_failure_details<ID: MachineIdSubtypeTrait>(
+    machine: &Machine<ID>,
     txn: &mut PgConnection,
     failure: FailureDetails,
 ) -> Result<(), DatabaseError> {
-    update_failure_details_by_machine_id(&machine.id, txn, failure).await
+    update_failure_details_by_machine_id(machine.id.as_machine_id(), txn, failure).await
 }
 
 pub async fn clear_failure_details(
@@ -1695,7 +2139,7 @@ pub async fn create(
     state: ManagedHostState,
     expected_machine_data: Option<&ExpectedMachineData>,
     state_model_version: i16,
-) -> DatabaseResult<Machine> {
+) -> DatabaseResult<AnyMachine> {
     let stable_machine_id_string = stable_machine_id.to_string();
 
     let default_metadata = &Metadata::default();
@@ -1714,6 +2158,15 @@ pub async fn create(
         None => true,                                   // EM entry does not exist
     };
     let host_profile = HostProfile::from_expected_machine(expected_machine_data);
+    let spx_multiplane = if stable_machine_id.machine_type() == MachineType::Host {
+        expected_machine_data
+            .map(|data| MachineSpxMultiplane::from_expected_interfaces(&data.interfaces))
+            .transpose()
+            .map_err(DatabaseError::internal)?
+            .flatten()
+    } else {
+        None
+    };
 
     // Host and DPU machines are created in same `discover_machine` call. Update same
     // state in both machines.
@@ -1764,8 +2217,8 @@ pub async fn create(
     };
 
     let query = r#"INSERT INTO machines(
-                            id, controller_state_version, controller_state, network_config_version, network_config, machine_state_model_version, asn, version, name, description, labels, rack_id, hw_sku, dpf, host_profile)
-                            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::json, $12, $13, $14, $15) RETURNING id"#;
+                            id, controller_state_version, controller_state, network_config_version, network_config, machine_state_model_version, asn, version, name, description, labels, rack_id, hw_sku, dpf, host_profile, spx_multiplane)
+                            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::json, $12, $13, $14, $15, $16) RETURNING id"#;
     let machine_id: MachineId = sqlx::query_as(query)
         .bind(&stable_machine_id_string)
         .bind(state_version)
@@ -1785,6 +2238,7 @@ pub async fn create(
             used_for_ingestion: false,
         }))
         .bind(sqlx::types::Json(&host_profile))
+        .bind(spx_multiplane.as_ref().map(sqlx::types::Json))
         .fetch_one(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
@@ -1816,20 +2270,23 @@ pub async fn update_slot_and_tray(
     slot_number: Option<i32>,
     tray_index: Option<i32>,
 ) -> DatabaseResult<()> {
-    sqlx::query("UPDATE machines SET slot_number = $1, tray_index = $2 WHERE id = $3")
-        .bind(slot_number)
-        .bind(tray_index)
-        .bind(machine_id)
-        .execute(txn)
-        .await
-        .map_err(|e| DatabaseError::new("update_slot_and_tray", e))?;
+    sqlx::query(
+        "UPDATE machines SET slot_number = COALESCE($1, slot_number), \
+         tray_index = COALESCE($2, tray_index) WHERE id = $3",
+    )
+    .bind(slot_number)
+    .bind(tray_index)
+    .bind(machine_id)
+    .execute(txn)
+    .await
+    .map_err(|e| DatabaseError::new("update_slot_and_tray", e))?;
     Ok(())
 }
 
 // Trigger DPU reprovisioning. For machine assigned to user, needs user approval to start
 // reprovisioning.
 pub async fn trigger_dpu_reprovisioning_request(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
     initiator: &str,
     update_firmware: bool,
@@ -1857,7 +2314,7 @@ pub async fn trigger_dpu_reprovisioning_request(
 
 // Update reprovision start time to the current time
 pub async fn update_dpu_reprovision_start_time(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     update_dpu_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
@@ -1865,7 +2322,7 @@ pub async fn update_dpu_reprovision_start_time(
 
 // Update reprovision start time to a specific start time
 pub async fn update_dpu_reprovision_explicit_start_time(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     time: DateTime<Utc>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1886,14 +2343,14 @@ pub async fn update_dpu_reprovision_explicit_start_time(
 
 // Update reprovision start time to the current time
 pub async fn update_host_reprovision_start_time(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     update_host_reprovision_explicit_start_time(machine_id, chrono::Utc::now(), txn).await
 }
 
 pub async fn update_host_reprovision_explicit_start_time(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     time: DateTime<Utc>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1914,7 +2371,7 @@ pub async fn update_host_reprovision_explicit_start_time(
 
 pub async fn get_host_reprovisioning_machines(
     txn: &mut PgConnection,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{}
@@ -1929,7 +2386,7 @@ pub async fn get_host_reprovisioning_machines(
 }
 
 pub async fn update_firmware_update_time_window_start_end(
-    machine_ids: &[MachineId],
+    machine_ids: &[impl MachineIdSubtypeTrait],
     start: chrono::DateTime<Utc>,
     end: chrono::DateTime<Utc>,
     txn: &mut PgConnection,
@@ -1937,7 +2394,7 @@ pub async fn update_firmware_update_time_window_start_end(
     let query = r#"UPDATE machines
                         SET firmware_update_time_window_start = $2, firmware_update_time_window_end = $3, update_complete = false
                        WHERE id = ANY($1) RETURNING id"#;
-    let _id = sqlx::query_as::<_, MachineId>(query)
+    sqlx::query_as::<_, MachineId>(query)
         .bind(machine_ids.iter().map(|x| x.to_string()).collect_vec())
         .bind(start)
         .bind(end)
@@ -1949,7 +2406,7 @@ pub async fn update_firmware_update_time_window_start_end(
 }
 
 pub async fn update_update_complete(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     complete: bool,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
@@ -1983,7 +2440,7 @@ pub async fn update_controller_state_outcome(
 
 // Update user's approval status in db.
 pub async fn approve_dpu_reprovision_request(
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
@@ -2002,7 +2459,7 @@ pub async fn approve_dpu_reprovision_request(
 }
 
 pub async fn approve_host_reprovision_request(
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let query = r#"UPDATE machines
@@ -2023,7 +2480,7 @@ pub async fn approve_host_reprovision_request(
 /// This will reset the dpu_reprov request.
 pub async fn restart_dpu_reprovisioning(
     txn: &mut PgConnection,
-    machine_ids: &[&MachineId],
+    machine_ids: &[&DpuMachineId],
     update_firmware: bool,
 ) -> Result<(), DatabaseError> {
     let restart_request = ReprovisionRequestRestart {
@@ -2048,7 +2505,7 @@ pub async fn restart_dpu_reprovisioning(
 /// This will fail if reprovisioning is already started.
 pub async fn clear_dpu_reprovisioning_request(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     validate_started_time: bool,
 ) -> Result<(), DatabaseError> {
     let query = if validate_started_time {
@@ -2070,7 +2527,7 @@ pub async fn clear_dpu_reprovisioning_request(
 
 pub async fn list_machines_requested_for_reprovisioning(
     txn: impl DbReader<'_>,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<DpuMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} WHERE m.reprovisioning_requested IS NOT NULL",
@@ -2085,7 +2542,7 @@ pub async fn list_machines_requested_for_reprovisioning(
 
 pub async fn list_machines_requested_for_host_reprovisioning(
     txn: impl DbReader<'_>,
-) -> Result<Vec<Machine>, DatabaseError> {
+) -> Result<Vec<HostMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             "{} WHERE m.host_reprovisioning_requested IS NOT NULL",
@@ -2098,43 +2555,164 @@ pub async fn list_machines_requested_for_host_reprovisioning(
         .map_err(|e| DatabaseError::query(query.as_str(), e))
 }
 
-/// Apply dpu agent upgrade policy to a single DPU.
-/// Returns Ok(true) if it needs upgrading, Ok(false) otherwise.
+/// Records a reset request, replacing a pending one. Reports false if one has already started.
+pub async fn trigger_managed_host_reset_request(
+    txn: &mut PgConnection,
+    initiator: &str,
+    machine_id: &MachineId,
+    ignore_cleanup: bool,
+) -> Result<bool, DatabaseError> {
+    let req = ResetRequest {
+        requested_at: chrono::Utc::now(),
+        initiator: initiator.to_string(),
+        started_at: None,
+        ignore_cleanup,
+    };
+
+    let query = "UPDATE machines SET reset_requested=$2
+                     WHERE id=$1
+                       AND (reset_requested IS NULL
+                            OR reset_requested->'started_at' = 'null'::jsonb) RETURNING id";
+    let requested = sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .bind(sqlx::types::Json(req))
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(requested.is_some())
+}
+
+/// Marks the reset as started, which closes it to `Clear` and stops the hinge re-firing.
+/// Guarded on `IS NOT NULL` because `jsonb_set` on a `NULL` column reports success unchanged.
+pub async fn update_managed_host_reset_start_time(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+) -> Result<(), DatabaseError> {
+    let query = r#"UPDATE machines
+                        SET reset_requested=
+                                    jsonb_set(reset_requested, '{started_at}', $2, true)
+                       WHERE id=$1 AND reset_requested IS NOT NULL RETURNING id"#;
+    let _id = sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .bind(sqlx::types::Json(chrono::Utc::now()))
+        .fetch_one(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(())
+}
+
+/// Clears a reset request and reports whether a row matched, optionally sparing a started one.
+pub async fn clear_managed_host_reset_request(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+    only_if_not_started: bool,
+) -> Result<bool, DatabaseError> {
+    let query = if only_if_not_started {
+        "UPDATE machines SET reset_requested=NULL
+            WHERE id=$1 AND reset_requested->'started_at' = 'null'::jsonb RETURNING id"
+    } else {
+        "UPDATE machines SET reset_requested=NULL WHERE id=$1 RETURNING id"
+    };
+
+    let cleared = sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_optional(txn)
+        .await
+        .map_err(|e| DatabaseError::new("clear reset_requested", e))?;
+
+    Ok(cleared.is_some())
+}
+
+pub async fn list_machines_requested_for_reset(
+    txn: impl DbReader<'_>,
+) -> Result<Vec<HostMachine>, DatabaseError> {
+    lazy_static! {
+        // Oldest first with the id breaking ties, since Postgres guarantees no order otherwise.
+        // Cast because the stored text has variable fractional digits and will not sort.
+        static ref query: String = format!(
+            "{} WHERE m.reset_requested IS NOT NULL
+                ORDER BY (m.reset_requested->>'requested_at')::timestamptz, m.id",
+            JSON_MACHINE_SNAPSHOT_QUERY.deref()
+        );
+    }
+    sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query.as_str(), e))
+}
+
+/// `find_dpu_agent_upgrade_status` reads the current upgrade inputs for an attached DPU.
+/// Returns `None` if the DPU, its host, or their non-BMC attachment is absent.
+pub async fn find_dpu_agent_upgrade_status<DB>(
+    conn: &mut DB,
+    dpu_machine_id: &DpuMachineId,
+) -> DatabaseResult<Option<DpuAgentUpgradeStatus>>
+where
+    for<'db> &'db mut DB: DbReader<'db>,
+{
+    let host_ids =
+        lookup_host_machine_ids_by_dpu_ids(&mut *conn, std::slice::from_ref(dpu_machine_id))
+            .await?;
+    let Some(host_machine_id) = host_ids.get(dpu_machine_id) else {
+        return Ok(None);
+    };
+
+    // Recheck the attachment in this read, since it can change after the host lookup.
+    // EXISTS avoids duplicate rows when several host interfaces attach to the DPU.
+    let query = r#"
+        SELECT dpu.id,
+               dpu.network_status_observation->>'agent_version' AS agent_version,
+               COALESCE((dpu.dpu_agent_upgrade_requested->>'should_upgrade')::bool, false)
+                   AS upgrade_requested,
+               (host.dpf->>'used_for_ingestion')::bool AS host_dpf_used_for_ingestion
+        FROM machines dpu
+        JOIN machines host ON host.id = $2
+        WHERE dpu.id = $1
+          AND EXISTS (
+              SELECT 1 FROM machine_interfaces mi
+              WHERE mi.machine_id = host.id
+                AND mi.attached_dpu_machine_id = dpu.id
+                AND mi.attached_dpu_machine_id != mi.machine_id
+                AND mi.interface_type != 'Bmc'
+          )"#;
+    sqlx::query_as(query)
+        .bind(dpu_machine_id)
+        .bind(host_machine_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))
+}
+
+/// `apply_agent_upgrade_policy` evaluates the supplied agent version and upgrade request.
+/// The caller handles hosts ingested through DPF before calling this helper.
+/// An `Off` policy or an absent version leaves the upgrade decision unchanged.
 pub async fn apply_agent_upgrade_policy(
     txn: &mut PgConnection,
     policy: AgentUpgradePolicy,
-    machine: &Machine,
-) -> Result<bool, DatabaseError> {
+    status: &DpuAgentUpgradeStatus,
+) -> Result<(), DatabaseError> {
     if policy == AgentUpgradePolicy::Off {
-        return Ok(false);
+        return Ok(());
     }
 
-    match machine.network_status_observation.as_ref() {
-        None => Ok(false),
-        Some(obs) => {
-            let carbide_api_version = carbide_version::v!(build_version);
-            let Some(agent_version) = obs.agent_version.clone() else {
-                return Ok(false);
-            };
-            let should_upgrade = policy.should_upgrade(&agent_version, carbide_api_version);
-            if should_upgrade != machine.needs_agent_upgrade() {
-                set_dpu_agent_upgrade_requested(
-                    txn,
-                    &machine.id,
-                    should_upgrade,
-                    carbide_api_version,
-                )
-                .await?;
-            }
-
-            Ok(true)
-        }
+    let Some(agent_version) = status.agent_version.as_deref() else {
+        return Ok(());
+    };
+    let carbide_api_version = carbide_version::v!(build_version);
+    let should_upgrade = policy.should_upgrade(agent_version, carbide_api_version);
+    if should_upgrade != status.upgrade_requested {
+        set_dpu_agent_upgrade_requested(txn, &status.id, should_upgrade, carbide_api_version)
+            .await?;
     }
+
+    Ok(())
 }
 
 pub async fn set_dpu_agent_upgrade_requested(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &DpuMachineId,
     should_upgrade: bool,
     to_version: &str,
 ) -> Result<(), DatabaseError> {
@@ -2153,10 +2731,14 @@ pub async fn set_dpu_agent_upgrade_requested(
     Ok(())
 }
 
-pub async fn find_machine_ids(
+pub async fn find_machine_ids<ID>(
     txn: impl DbReader<'_>,
     search_config: MachineSearchConfig,
-) -> Result<Vec<MachineId>, DatabaseError> {
+) -> Result<Vec<ID>, DatabaseError>
+where
+    ID: TryFrom<MachineId>,
+    DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+{
     let mut qb = sqlx::QueryBuilder::new("SELECT id FROM machines");
 
     if search_config.mnnvl_only {
@@ -2214,7 +2796,10 @@ pub async fn find_machine_ids(
     }
 
     if let Some(ovrrd_str) = &search_config.only_with_health_alert {
-        qb.push(" AND health_reports->'merges' ? ");
+        // Match the machine_health_source_keys_gin_idx index.
+        qb.push(
+            " AND jsonb_path_query_array(health_reports, '$.merges.keyvalue().key'::jsonpath) ? ",
+        );
         qb.push_bind(ovrrd_str.clone());
         qb.push(" AND jsonb_array_length(health_reports->'merges'->");
         qb.push_bind(ovrrd_str);
@@ -2264,12 +2849,71 @@ pub async fn find_machine_ids(
         .await
         .map_err(|e| DatabaseError::new("find_machine_ids", e))?;
 
-    Ok(machine_ids)
+    Ok(machine_ids
+        .into_iter()
+        .map(ID::try_from)
+        .collect::<Result<Vec<ID>, _>>()?)
+}
+
+/// `try_update_controller_state` updates a host and its attached DPUs only if
+/// the host's controller-state version still matches `expected_version`.
+///
+/// The caller supplies `new_version` for every machine and its history entry.
+/// `NotApplied(ControllerStateNotCurrent)` means the host is missing or its
+/// version changed; no state or history changes remain. Successful writes return
+/// `Applied(())` and remain in the caller's transaction. Database failures remain
+/// errors.
+pub async fn try_update_controller_state(
+    txn: &mut PgConnection,
+    host_id: &HostMachineId,
+    expected_version: ConfigVersion,
+    new_version: ConfigVersion,
+    new_state: &ManagedHostState,
+) -> Result<ConditionalWrite<(), ControllerStateNotCurrent>, DatabaseError> {
+    let mut inner_txn = Transaction::begin_inner(txn).await?;
+
+    // `advance` takes the history retention lock before the machine row lock.
+    // Reversing that order can deadlock. Roll back the history if the host
+    // version changed.
+    crate::state_history::persist(
+        inner_txn.as_pgconn(),
+        crate::state_history::StateHistoryTableId::Machine,
+        host_id,
+        new_state,
+        new_version,
+    )
+    .await?;
+
+    let query = r#"
+        UPDATE machines
+        SET controller_state_version = $1, controller_state = $2
+        WHERE id = $3 AND controller_state_version = $4
+        RETURNING id
+    "#;
+    let updated: Option<HostMachineId> = sqlx::query_scalar(query)
+        .bind(new_version)
+        .bind(sqlx::types::Json(new_state))
+        .bind(host_id)
+        .bind(expected_version)
+        .fetch_optional(inner_txn.as_pgconn())
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    if updated.is_none() {
+        inner_txn.rollback().await?;
+        return Ok(ConditionalWrite::NotApplied(ControllerStateNotCurrent));
+    }
+
+    tracing::info!(machine_id = %host_id, next_state = ?new_state, "Updating host state");
+    for dpu in find_dpus_by_host_machine_id(inner_txn.as_pgconn(), host_id).await? {
+        advance(&dpu, inner_txn.as_pgconn(), new_state, Some(new_version)).await?;
+    }
+    inner_txn.commit().await?;
+    Ok(ConditionalWrite::Applied(()))
 }
 
 pub async fn update_state(
     txn: &mut PgConnection,
-    host_id: &MachineId,
+    host_id: &HostMachineId,
     new_state: &ManagedHostState,
 ) -> Result<(), DatabaseError> {
     let host = find_one(
@@ -2296,11 +2940,15 @@ pub async fn update_state(
     Ok(())
 }
 
+/// Records the database statement execution time as the machine's validation timestamp.
+///
+/// This ensures validation completed after a concurrent state transition is recorded as newer than
+/// that transition, even when the validation transaction began first.
 pub async fn update_machine_validation_time(
     machine_id: &MachineId,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
-    let query = "UPDATE machines SET last_machine_validation_time=NOW() WHERE id=$1 RETURNING id";
+    let query = "UPDATE machines SET last_machine_validation_time=clock_timestamp() WHERE id=$1 RETURNING id";
     let _id = sqlx::query_as::<_, MachineId>(query)
         .bind(machine_id)
         .fetch_one(txn)
@@ -2419,9 +3067,10 @@ pub async fn find_dpu_infos(txn: &mut PgConnection) -> Result<Vec<DpuInfo>, Data
         .into_iter()
         .map(
             |(id, loopback_ip, controller_state, network_status_observation, firmware_version)| {
-                let dpu_id = MachineId::from_str(&id).map_err(|e| {
+                let dpu_id = DpuMachineId::try_from(MachineId::from_str(&id).map_err(|e| {
                     DatabaseError::internal(format!("Invalid DPU machine ID {id}: {e}"))
-                })?;
+                })?)
+                .map_err(|e| DatabaseError::internal(e.to_string()))?;
                 let network_status_observation = network_status_observation.0;
                 let representors = network_status_observation
                     .as_ref()
@@ -2449,14 +3098,32 @@ pub async fn find_dpu_infos(txn: &mut PgConnection) -> Result<Vec<DpuInfo>, Data
 
 /// Allocate a value from the loopback IP resource pool.
 ///
+/// Reuses the DPU's existing reservation before allocating a new value, so a
+/// surviving pool ownership record and a missing `network_config.loopback_ip`
+/// field cannot give one DPU two `lo-ip` values. A duplicate reservation for
+/// the same owner is reported as inconsistent state rather than picking one.
+///
 /// If the pool exists but is empty or has en error, return that.
 pub async fn allocate_loopback_ip(
     common_pools: &CommonPools,
     txn: &mut PgConnection,
     owner_id: &str,
 ) -> Result<IpAddr, DatabaseError> {
+    let pool = &common_pools.ethernet.pool_loopback_ip;
+
+    if let Some(value) = crate::resource_pool::find_owned_allocation(
+        pool,
+        txn,
+        resource_pool::OwnerType::Machine,
+        owner_id,
+    )
+    .await?
+    {
+        return Ok(value);
+    }
+
     match crate::resource_pool::allocate(
-        &common_pools.ethernet.pool_loopback_ip,
+        pool,
         txn,
         resource_pool::OwnerType::Machine,
         owner_id,
@@ -2471,7 +3138,7 @@ pub async fn allocate_loopback_ip(
             ),
         ) => {
             crate::resource_pool::emit_allocation_failure(
-                common_pools.ethernet.pool_loopback_ip.value_type,
+                pool.value_type,
                 owner_id,
                 false,
                 "lo-ip",
@@ -2481,7 +3148,7 @@ pub async fn allocate_loopback_ip(
         }
         Err(err) => {
             crate::resource_pool::emit_allocation_failure(
-                common_pools.ethernet.pool_loopback_ip.value_type,
+                pool.value_type,
                 owner_id,
                 false,
                 "lo-ip",
@@ -2606,7 +3273,7 @@ pub async fn allocate_vpc_dpu_loopback(
 pub async fn find_by_validation_id(
     txn: &mut PgConnection,
     validation_id: &MachineValidationId,
-) -> Result<Option<Machine>, DatabaseError> {
+) -> Result<Option<AnyMachine>, DatabaseError> {
     lazy_static! {
         static ref query: String = format!(
             r#"{}
@@ -2643,12 +3310,12 @@ pub async fn set_firmware_autoupdate(
 
 pub async fn update_rack_fw_details(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     details: Option<&model::rack::RackFirmwareUpgradeStatus>,
 ) -> Result<(), DatabaseError> {
     let query =
         "UPDATE machines SET rack_fw_details = $1, updated = NOW() WHERE id = $2 RETURNING id";
-    sqlx::query_as::<_, MachineId>(query)
+    sqlx::query_as::<_, HostMachineId>(query)
         .bind(details.map(|d| sqlx::types::Json(d.clone())))
         .bind(machine_id)
         .fetch_optional(txn)
@@ -2676,7 +3343,7 @@ pub async fn set_machine_validation_request(
 
 pub async fn set_machine_maintenance_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
     initiator: &str,
     operation: MachineMaintenanceOperation,
 ) -> DatabaseResult<()> {
@@ -2697,7 +3364,7 @@ pub async fn set_machine_maintenance_requested(
 
 pub async fn set_decommission_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> DatabaseResult<()> {
     let query = "UPDATE machines SET decommission_requested = TRUE WHERE id = $1 RETURNING id";
     sqlx::query_as::<_, MachineId>(query)
@@ -2710,7 +3377,7 @@ pub async fn set_decommission_requested(
 
 pub async fn clear_decommission_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> DatabaseResult<()> {
     let query = "UPDATE machines SET decommission_requested = FALSE WHERE id = $1 RETURNING id";
     sqlx::query_as::<_, MachineId>(query)
@@ -2721,18 +3388,24 @@ pub async fn clear_decommission_requested(
         .map_err(|error| DatabaseError::new("clear_decommission_requested", error))
 }
 
+/// Clears only the maintenance request that the controller completed.
+/// A missing machine or a different pending request returns `NotApplied`.
 pub async fn clear_machine_maintenance_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
-) -> DatabaseResult<()> {
-    let query =
-        "UPDATE machines SET machine_maintenance_requested = NULL WHERE id = $1 RETURNING id";
-    sqlx::query_as::<_, MachineId>(query)
+    machine_id: impl MachineIdSubtypeTrait,
+    request: &model::machine::MachineMaintenanceRequest,
+) -> DatabaseResult<ConditionalWrite<(), crate::MaintenanceRequestNotCurrent>> {
+    let query = "UPDATE machines SET machine_maintenance_requested = NULL WHERE id = $1 AND machine_maintenance_requested = $2 RETURNING id";
+    let cleared = sqlx::query_as::<_, MachineId>(query)
         .bind(machine_id)
-        .fetch_one(txn)
+        .bind(sqlx::types::Json(request))
+        .fetch_optional(txn)
         .await
         .map_err(|e| DatabaseError::new("clear_machine_maintenance_requested", e))?;
-    Ok(())
+    Ok(match cleared {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(crate::MaintenanceRequestNotCurrent),
+    })
 }
 
 /// Record an operator "force-converge this BMC now" request on the machine that
@@ -2740,7 +3413,7 @@ pub async fn clear_machine_maintenance_requested(
 /// The machine state controller consumes it on its next sweep.
 pub async fn set_bmc_credential_rotation_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: &MachineId,
 ) -> DatabaseResult<()> {
     let query =
         "UPDATE machines SET bmc_credential_rotation_requested = true WHERE id = $1 RETURNING id";
@@ -2762,7 +3435,7 @@ pub async fn set_bmc_credential_rotation_requested(
 
 pub async fn clear_bmc_credential_rotation_requested(
     txn: &mut PgConnection,
-    machine_id: MachineId,
+    machine_id: &MachineId,
 ) -> DatabaseResult<()> {
     let query =
         "UPDATE machines SET bmc_credential_rotation_requested = false WHERE id = $1 RETURNING id";
@@ -2830,6 +3503,79 @@ pub async fn clear_uefi_credential_rotation_requested(
     Ok(())
 }
 
+/// Record that an operator has requested rotating the NIC lockdown keys for a host
+/// (bypasses the site-config flag for NIC lockdown rotation)
+pub async fn set_lockdown_ikm_credential_rotation_requested(
+    txn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET lockdown_ikm_credential_rotation_requested = true \
+                 WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            // `RETURNING id` yields no row for an unknown machine; surface a
+            // clean not-found rather than a generic wrapped error.
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("set_lockdown_ikm_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
+/// Clear the force NIC lockdown rotation flag for this host
+pub async fn clear_lockdown_ikm_credential_rotation_requested(
+    txn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<()> {
+    let query = "UPDATE machines SET lockdown_ikm_credential_rotation_requested = false \
+                 WHERE id = $1 RETURNING id";
+    sqlx::query_as::<_, MachineId>(query)
+        .bind(machine_id)
+        .fetch_one(txn)
+        .await
+        .map_err(|e| match e {
+            // `RETURNING id` yields no row for an unknown machine; surface a
+            // clean not-found rather than a generic wrapped error.
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("clear_lockdown_ikm_credential_rotation_requested", e),
+        })?;
+    Ok(())
+}
+
+/// Read a host's one-shot NIC lockdown IKM rotation force flag. The SVPC scout
+/// handler consults this so the tenant-allocation lock migrates a force-flagged
+/// host's cards to the site-wide target even when the site-wide gate is off,
+/// mirroring the idle rekey path.
+pub async fn get_lockdown_ikm_credential_rotation_requested(
+    conn: &mut PgConnection,
+    machine_id: HostMachineId,
+) -> DatabaseResult<bool> {
+    let query = "SELECT lockdown_ikm_credential_rotation_requested FROM machines WHERE id = $1";
+    sqlx::query_scalar::<_, bool>(query)
+        .bind(machine_id)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => DatabaseError::NotFoundError {
+                kind: "machine",
+                id: machine_id.to_string(),
+            },
+            e => DatabaseError::new("get_lockdown_ikm_credential_rotation_requested", e),
+        })
+}
+
+/// `update_dpu_asns` backfills missing DPU ASNs. If an assignment no longer
+/// applies, its unused reservation is rolled back and the batch continues.
+/// Successful assignments commit together; allocation or database errors roll
+/// back the batch.
 pub async fn update_dpu_asns(
     db_pool: &Pool<Postgres>,
     common_pools: &CommonPools,
@@ -2846,7 +3592,6 @@ pub async fn update_dpu_asns(
         );
         return Ok(());
     }
-    // Get all DPU IP addresses except the requester DPU machine
     let query = "SELECT id FROM machines WHERE starts_with(id, $1) AND asn IS NULL";
 
     let dpu_ids: Vec<MachineId> = sqlx::query_as(query)
@@ -2860,9 +3605,10 @@ pub async fn update_dpu_asns(
     }
 
     for dpu_machine_id in dpu_ids.iter() {
+        let mut assignment_txn = Transaction::begin_inner(txn.as_pgconn()).await?;
         let asn: i64 = crate::resource_pool::allocate(
             &common_pools.ethernet.pool_fnn_asn,
-            &mut txn,
+            assignment_txn.as_pgconn(),
             resource_pool::OwnerType::Machine,
             &dpu_machine_id.to_string(),
             None,
@@ -2871,12 +3617,21 @@ pub async fn update_dpu_asns(
 
         let query = "UPDATE machines set asn=$1 WHERE id=$2 and asn is null";
 
-        sqlx::query(query)
+        let rows_affected = sqlx::query(query)
             .bind(asn)
             .bind(dpu_machine_id)
-            .execute(txn.as_pgconn())
+            .execute(assignment_txn.as_pgconn())
             .await
-            .map_err(|e| DatabaseError::query(query, e))?;
+            .map_err(|e| DatabaseError::query(query, e))?
+            .rows_affected();
+
+        if rows_affected == 0 {
+            // Another writer assigned the ASN or removed the DPU after our
+            // scan. We no longer need the reservation made in this savepoint.
+            assignment_txn.rollback().await?;
+        } else {
+            assignment_txn.commit().await?;
+        }
     }
 
     txn.commit().await?;
@@ -2957,7 +3712,7 @@ pub async fn update_dpu_loopback_ips_v6(
             })?;
             network_config.loopback_ip_v6 = Some(loopback_ip_v6);
 
-            if try_update_network_config_unless_force_deleting(
+            match try_update_network_config_unless_force_deleting(
                 txn.as_pgconn(),
                 &dpu_machine_id,
                 network_config_version,
@@ -2965,9 +3720,12 @@ pub async fn update_dpu_loopback_ips_v6(
             )
             .await?
             {
-                txn.commit().await?;
-                last_conflicting_version = None;
-                break;
+                ConditionalWrite::Applied(()) => {
+                    txn.commit().await?;
+                    last_conflicting_version = None;
+                    break;
+                }
+                ConditionalWrite::NotApplied(MachineNetworkConfigNotCurrent) => {}
             }
 
             let force_deleting_or_deleted =
@@ -3137,6 +3895,37 @@ pub async fn find_machine_ids_by_sku_ids(
         .collect())
 }
 
+/// Records whether force deletion was asked to wait for an Admin acknowledgement.
+/// A true requirement survives retries; false only preserves an existing choice
+/// or records that no wait was requested. The caller must hold the host row lock
+/// and commit this together with `ForceDeletion` and any Admin request.
+pub async fn record_force_delete_admin_ack_requirement(
+    txn: &mut PgConnection,
+    machine_id: &HostMachineId,
+    requires_admin_ack: bool,
+) -> DatabaseResult<bool> {
+    let query = "SELECT force_delete_requires_admin_ack FROM machines WHERE id = $1";
+    let recorded: Option<bool> = sqlx::query_scalar(query)
+        .bind(machine_id)
+        .fetch_one(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    if let Some(recorded) = recorded
+        && (recorded || !requires_admin_ack)
+    {
+        return Ok(recorded);
+    }
+
+    let query = "UPDATE machines SET force_delete_requires_admin_ack = $2 WHERE id = $1
+                 RETURNING force_delete_requires_admin_ack";
+    sqlx::query_scalar(query)
+        .bind(machine_id)
+        .bind(requires_admin_ack)
+        .fetch_one(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
 pub async fn get_network_config(
     txn: impl DbReader<'_>,
     machine_id: &MachineId,
@@ -3169,19 +3958,33 @@ pub async fn get_quarantine_state(
     Ok(network_config.value.quarantine_state)
 }
 
+/// Sets quarantine and returns the previous state only after the conditional
+/// write applies. Returns an error if the network configuration is missing or
+/// changes before the write.
 pub async fn set_quarantine_state(
     txn: &mut PgConnection,
-    machine_id: &MachineId,
+    machine_id: &HostMachineId,
     quarantine_state: ManagedHostQuarantineState,
 ) -> Result<Option<ManagedHostQuarantineState>, DatabaseError> {
     let (mut network_config, network_config_version) =
         get_network_config(&mut *txn, machine_id).await?.take();
     let old_quarantine_state = network_config.quarantine_state.clone();
     network_config.quarantine_state = Some(quarantine_state);
-    try_update_network_config(txn, machine_id, network_config_version, &network_config).await?;
-    Ok(old_quarantine_state)
+    match try_update_network_config(txn, machine_id, network_config_version, &network_config)
+        .await?
+    {
+        ConditionalWrite::Applied(()) => Ok(old_quarantine_state),
+        ConditionalWrite::NotApplied(MachineNetworkConfigNotCurrent) => {
+            Err(DatabaseError::FailedPrecondition(format!(
+                "network configuration for machine {machine_id} changed or is no longer available"
+            )))
+        }
+    }
 }
 
+/// Clears quarantine and returns the previous state only after the conditional
+/// write applies. Returns an error if the network configuration is missing or
+/// changes before the write.
 pub async fn clear_quarantine_state(
     txn: &mut PgConnection,
     machine_id: &MachineId,
@@ -3190,8 +3993,16 @@ pub async fn clear_quarantine_state(
         get_network_config(&mut *txn, machine_id).await?.take();
     let old_quarantine_state = network_config.quarantine_state.clone();
     network_config.quarantine_state = None;
-    try_update_network_config(txn, machine_id, network_config_version, &network_config).await?;
-    Ok(old_quarantine_state)
+    match try_update_network_config(txn, machine_id, network_config_version, &network_config)
+        .await?
+    {
+        ConditionalWrite::Applied(()) => Ok(old_quarantine_state),
+        ConditionalWrite::NotApplied(MachineNetworkConfigNotCurrent) => {
+            Err(DatabaseError::FailedPrecondition(format!(
+                "network configuration for machine {machine_id} changed or is no longer available"
+            )))
+        }
+    }
 }
 
 pub async fn modify_dpf_state(
@@ -3262,6 +4073,10 @@ pub struct MachineRmsIdentity {
     pub bmc_mac_address: MacAddress,
     pub rack_id: Option<RackId>,
     pub rack_profile_id: Option<RackProfileId>,
+    /// Physical slot number last reported by RMS, or `None` if none has been recorded.
+    pub slot_number: Option<i32>,
+    /// Physical tray index last reported by RMS, or `None` if none has been recorded.
+    pub tray_index: Option<i32>,
 }
 
 /// Look up RMS identities and rack profile context for compute tray machines by
@@ -3277,7 +4092,9 @@ pub async fn find_rms_identities_by_bmc_ips(
             mia.address AS bmc_ip,
             mi.mac_address AS bmc_mac_address,
             m.rack_id,
-            r.rack_profile_id
+            r.rack_profile_id,
+            m.slot_number,
+            m.tray_index
         FROM machines m
         LEFT JOIN racks r ON r.id = m.rack_id
         JOIN machine_interfaces mi
@@ -3306,42 +4123,8 @@ pub async fn find_rms_identities_by_bmc_ips(
     Ok(rows)
 }
 
-/// Persist the backend firmware-object job ID for a machine that was updated via
-/// --bypass-state-controller. This survives nico-api restarts so that
-/// get_firmware_status can keep querying the backend even after the in-memory map is
-/// cleared.
-pub async fn save_backend_firmware_object_job_id(
-    db: &sqlx::PgPool,
-    machine_id: &str,
-    job_id: &str,
-) -> DatabaseResult<()> {
-    let sql =
-        "UPDATE machines SET backend_firmware_object_job_id = $1 WHERE id::text = $2 RETURNING id";
-    sqlx::query(sql)
-        .bind(job_id)
-        .bind(machine_id)
-        .execute(db)
-        .await
-        .map_err(|e| DatabaseError::new(sql, e))?;
-    Ok(())
-}
-
-/// Fetch the persisted backend firmware-object job ID for a machine, if any.
-pub async fn get_backend_firmware_object_job_id(
-    db: &sqlx::PgPool,
-    machine_id: &str,
-) -> DatabaseResult<Option<String>> {
-    let sql = "SELECT backend_firmware_object_job_id FROM machines WHERE id::text = $1";
-    let row: Option<(Option<String>,)> = sqlx::query_as(sql)
-        .bind(machine_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| DatabaseError::new(sql, e))?;
-    Ok(row.and_then(|(job_id,)| job_id))
-}
-
 pub fn count_healthy_unhealthy_host_machines(
-    all_machines: &HashMap<MachineId, model::machine::ManagedHostStateSnapshot>,
+    all_machines: &HashMap<HostMachineId, model::machine::ManagedHostStateSnapshot>,
 ) -> (i32, i32) {
     let without_fault_count = all_machines
         .iter()
@@ -3364,27 +4147,1124 @@ mod test {
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv6Addr};
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use carbide_instrument::testing::{MetricsCapture, capture_logs_async};
-    use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+    use carbide_uuid::machine::{
+        DpuMachineId, HostMachineId, HostMachineIdSubtypeTrait, MachineId, MachineIdSource,
+        MachineInterfaceId, MachineType, StableHostMachineId,
+    };
     use carbide_uuid::network::NetworkSegmentId;
     use model::allocation_type::AllocationType;
     use model::bmc_info::BmcInfo;
     use model::hardware_info::HardwareInfo;
-    use model::machine::ManagedHostState;
     use model::machine::machine_search_config::MachineSearchConfig;
     use model::machine::topology::{DiscoveryData, TopologyData};
+    use model::machine::{MachineState, ManagedHostState};
+    use model::machine_interface::InterfaceType;
     use model::resource_pool::common::{
         CommonPools, DPA_VNI, EXTERNAL_VPC_VNI, EthernetPools, FNN_ASN, IbPools, LOOPBACK_IP,
         LOOPBACK_IP_V6, VLANID, VNI, VPC_DPU_LOOPBACK, VPC_VNI,
     };
     use model::resource_pool::define::{Range, ResourcePoolDef, ResourcePoolType};
     use model::resource_pool::{ResourcePool, ValueType};
-    use tokio::sync::oneshot;
+
+    fn machine_id(seed: u8, ty: MachineType) -> MachineId {
+        MachineId::new(MachineIdSource::ProductBoardChassisSerial, [seed; 32], ty)
+    }
+
+    #[crate::sqlx_test]
+    async fn host_state_lookup_preserves_association_and_decode_checks(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let dpu_id: DpuMachineId =
+            "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80".parse()?;
+        let other_dpu_id: DpuMachineId =
+            "fm100ds7blqjsadm2uuh3qqbf1h7k8pmf47um6v9uckrg7l03po8mhqgvng".parse()?;
+        let host_state = ManagedHostState::HostInit {
+            machine_state: MachineState::WaitingForPlatformConfiguration { retry_count: 3 },
+        };
+        let mut txn = pool.begin().await?;
+        for (machine_id, state) in [
+            (MachineId::from(host_id), host_state.clone()),
+            (MachineId::from(dpu_id), ManagedHostState::Ready),
+            (MachineId::from(other_dpu_id), ManagedHostState::Ready),
+        ] {
+            super::create(txn.as_mut(), None, &machine_id, state, None, 2).await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version)
+             VALUES ('host-state-lookup', 'V1-T0') RETURNING id",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        // Keep excluded interfaces present when adding the valid attachment.
+        for (index, (scenario, machine_id, interface_type, expected)) in [
+            (
+                "self attachment",
+                MachineId::from(dpu_id),
+                InterfaceType::Data,
+                None,
+            ),
+            (
+                "BMC attachment",
+                MachineId::from(host_id),
+                InterfaceType::Bmc,
+                None,
+            ),
+            (
+                "data attachment",
+                MachineId::from(host_id),
+                InterfaceType::Data,
+                Some(&host_state),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO machine_interfaces
+                    (machine_id, attached_dpu_machine_id, association_type, segment_id,
+                     mac_address, primary_interface, hostname, interface_type)
+                 VALUES ($1, $2, 'Machine', $3, $4::macaddr, false, 'host-state-lookup', $5)",
+            )
+            .bind(machine_id)
+            .bind(dpu_id)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:21:{index:02x}"))
+            .bind(interface_type)
+            .execute(txn.as_mut())
+            .await?;
+            let state = super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &dpu_id).await?;
+            assert_eq!(state.as_ref(), expected, "{scenario}");
+        }
+        assert_eq!(
+            super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &other_dpu_id).await?,
+            None,
+            "an attachment to one DPU must not match another DPU"
+        );
+
+        for (scenario, owner_id, state, column) in [
+            (
+                "DPU-typed owner is a decode error",
+                MachineId::from(other_dpu_id),
+                serde_json::to_value(ManagedHostState::Ready)?,
+                "0",
+            ),
+            (
+                "malformed host state is not a missing association",
+                MachineId::from(host_id),
+                serde_json::json!({}),
+                "1",
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE machine_interfaces SET machine_id = $1
+                 WHERE attached_dpu_machine_id = $2 AND machine_id != $2
+                   AND interface_type != 'Bmc'",
+            )
+            .bind(owner_id)
+            .bind(dpu_id)
+            .execute(txn.as_mut())
+            .await?;
+            sqlx::query("UPDATE machines SET controller_state = $2 WHERE id = $1")
+                .bind(owner_id)
+                .bind(state)
+                .execute(txn.as_mut())
+                .await?;
+
+            let error = super::lookup_host_state_by_dpu_machine_id(txn.as_mut(), &dpu_id)
+                .await
+                .expect_err(scenario);
+            let crate::DatabaseError::Sqlx(annotated) = &error else {
+                panic!("{scenario}: expected Sqlx, got {error:?}");
+            };
+            let sqlx::Error::ColumnDecode { index, .. } = &annotated.source else {
+                panic!("{scenario}: expected ColumnDecode, got {error:?}");
+            };
+            assert_eq!(index, column, "{scenario}");
+        }
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    /// `find_dpus_by_host_machine_id` returns each DPU attached to the host through a
+    /// non-BMC interface once, and restricts the snapshot to those DPUs before the
+    /// per-machine enrichment runs. The lateral topology join executes once per machine
+    /// that reaches it, so its loop count shows which machines were enriched.
+    #[crate::sqlx_test]
+    async fn find_dpus_by_host_enriches_only_the_matching_dpus(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host_id = HostMachineId::try_from(machine_id(1, MachineType::Host))?;
+        let dpu_ids = [
+            DpuMachineId::try_from(machine_id(2, MachineType::Dpu))?,
+            DpuMachineId::try_from(machine_id(3, MachineType::Dpu))?,
+        ];
+        let bmc_only_dpu_id = DpuMachineId::try_from(machine_id(8, MachineType::Dpu))?;
+        // Unrelated hosts and DPUs make a fleet-wide plan observable.
+        let other_pairs = [
+            (
+                HostMachineId::try_from(machine_id(4, MachineType::Host))?,
+                DpuMachineId::try_from(machine_id(5, MachineType::Dpu))?,
+            ),
+            (
+                HostMachineId::try_from(machine_id(6, MachineType::Host))?,
+                DpuMachineId::try_from(machine_id(7, MachineType::Dpu))?,
+            ),
+        ];
+
+        let mut txn = pool.begin().await?;
+        let fleet = [MachineId::from(host_id), MachineId::from(bmc_only_dpu_id)]
+            .into_iter()
+            .chain(dpu_ids.map(MachineId::from))
+            .chain(
+                other_pairs
+                    .iter()
+                    .flat_map(|(host, dpu)| [MachineId::from(*host), MachineId::from(*dpu)]),
+            );
+        for id in fleet {
+            super::create(txn.as_mut(), None, &id, ManagedHostState::Ready, None, 2).await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version)
+             VALUES ('dpus-by-host', 'V1-T0') RETURNING id",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+        // The first DPU is attached through two data interfaces and must be returned once;
+        // the DPU attached only through a BMC interface must be excluded.
+        let attachments = [
+            (host_id, dpu_ids[0], InterfaceType::Data),
+            (host_id, dpu_ids[0], InterfaceType::Data),
+            (host_id, dpu_ids[1], InterfaceType::Data),
+            (host_id, bmc_only_dpu_id, InterfaceType::Bmc),
+            (other_pairs[0].0, other_pairs[0].1, InterfaceType::Data),
+            (other_pairs[1].0, other_pairs[1].1, InterfaceType::Data),
+        ];
+        for (index, (owner_id, dpu_id, interface_type)) in attachments.into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO machine_interfaces
+                    (machine_id, attached_dpu_machine_id, association_type, segment_id,
+                     mac_address, primary_interface, hostname, interface_type)
+                 VALUES ($1, $2, 'Machine', $3, $4::macaddr, false, 'dpus-by-host', $5)",
+            )
+            .bind(MachineId::from(owner_id))
+            .bind(dpu_id)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:22:{index:02x}"))
+            .bind(interface_type)
+            .execute(txn.as_mut())
+            .await?;
+        }
+
+        let mut found: Vec<DpuMachineId> =
+            super::find_dpus_by_host_machine_id(txn.as_mut(), &host_id)
+                .await?
+                .into_iter()
+                .map(|dpu| dpu.id)
+                .collect();
+        found.sort();
+        let mut expected = dpu_ids.to_vec();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        fn actual_loops(node: &serde_json::Value, relation: &str, loops: &mut Vec<u64>) {
+            if node["Relation Name"] == relation {
+                loops.push(node["Actual Loops"].as_u64().unwrap_or_default());
+            }
+            for child in node["Plans"].as_array().into_iter().flatten() {
+                actual_loops(child, relation, loops);
+            }
+        }
+        let explain = format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+            super::FIND_DPUS_BY_HOST_MACHINE_ID_QUERY.as_str()
+        );
+        let sqlx::types::Json(plan): sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind(host_id)
+                .fetch_one(txn.as_mut())
+                .await?;
+        let mut loops = Vec::new();
+        actual_loops(&plan[0]["Plan"], "machine_topologies", &mut loops);
+        assert_eq!(loops, vec![dpu_ids.len() as u64], "{plan:#}");
+
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn health_alert_search_uses_source_keys(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let source = "future.source with 'quotes' and \"double quotes\"";
+        let populated = serde_json::json!({
+            "merges": {
+                source: {"alerts": [{"id": "leak", "message": "nested payload"}]},
+                "empty": {"alerts": []}
+            }
+        });
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        sqlx::query("UPDATE machines SET health_reports = $1 WHERE id = $2")
+            .bind(&populated)
+            .bind(machine_id)
+            .execute(txn.as_mut())
+            .await?;
+        txn.commit().await?;
+
+        // Reconstruct the predecessor index with populated data, then apply the
+        // shipped replacement outside a transaction, as the migrator does.
+        sqlx::raw_sql(
+            "DROP INDEX machine_health_source_keys_gin_idx;
+             CREATE INDEX machine_health_reports_merges_gin_idx ON machines
+             USING gin ((health_reports->'merges'));",
+        )
+        .execute(&pool)
+        .await?;
+        for migration in [
+            include_str!("../migrations/20261013175247_machine_health_source_keys_gin.sql"),
+            include_str!("../migrations/20261013175248_drop_machine_health_reports_merges_gin.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await?;
+        }
+
+        for (scenario, reports, searched_source, expected) in [
+            ("arbitrary source", Some(populated.clone()), source, true),
+            ("empty alerts", Some(populated.clone()), "empty", false),
+            (
+                "nested value is not a source",
+                Some(populated),
+                "leak",
+                false,
+            ),
+            ("absent reports", None, source, false),
+            ("absent merges", Some(serde_json::json!({})), source, false),
+        ] {
+            sqlx::query("UPDATE machines SET health_reports = $1 WHERE id = $2")
+                .bind(reports)
+                .bind(machine_id)
+                .execute(&pool)
+                .await?;
+            let ids: Vec<HostMachineId> = super::find_machine_ids(
+                &pool,
+                MachineSearchConfig {
+                    only_with_health_alert: Some(searched_source.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            assert_eq!(ids.contains(&machine_id), expected, "{scenario}");
+        }
+
+        // A generic prepared plan must match the expression index even when
+        // the report source is supplied as a parameter.
+        let mut txn = pool.begin().await?;
+        sqlx::raw_sql(
+            "SET LOCAL enable_seqscan = off; SET LOCAL plan_cache_mode = force_generic_plan",
+        )
+        .execute(txn.as_mut())
+        .await?;
+        let _: Vec<HostMachineId> = super::find_machine_ids(
+            txn.as_mut(),
+            MachineSearchConfig {
+                only_with_health_alert: Some(source.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let statement: String = sqlx::query_scalar(
+            "SELECT statement FROM pg_prepared_statements
+             WHERE statement LIKE 'SELECT id FROM machines%'
+             AND statement LIKE '%jsonb_array_length%'",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+        let plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {statement}")))
+                .bind(source)
+                .bind(source)
+                .fetch_all(txn.as_mut())
+                .await?;
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("machine_health_source_keys_gin_idx")),
+            "source-key index missing from plan: {plan:?}"
+        );
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn dpu_agent_upgrade_status_reads_current_attached_host_data(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let host_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let dpu_id: DpuMachineId =
+            "fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80".parse()?;
+        let mut txn = pool.begin().await?;
+        assert!(
+            super::find_dpu_agent_upgrade_status(txn.as_mut(), &dpu_id)
+                .await?
+                .is_none()
+        );
+        for machine_id in [MachineId::from(host_id), MachineId::from(dpu_id)] {
+            super::create(
+                txn.as_mut(),
+                None,
+                &machine_id,
+                ManagedHostState::Ready,
+                None,
+                2,
+            )
+            .await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version)
+             VALUES ('agent-upgrade-status', 'V1-T0') RETURNING id",
+        )
+        .fetch_one(txn.as_mut())
+        .await?;
+
+        // Add one interface at a time. BMC and self links must not attach a host;
+        // multiple data interfaces on that host are a valid attachment.
+        for (index, (scenario, machine_id, interface_type, attached)) in [
+            ("self link", MachineId::from(dpu_id), "Data", false),
+            ("BMC link", MachineId::from(host_id), "Bmc", false),
+            ("data link", MachineId::from(host_id), "Data", true),
+            ("second data link", MachineId::from(host_id), "Data", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO machine_interfaces
+                    (machine_id, attached_dpu_machine_id, association_type, segment_id,
+                     mac_address, primary_interface, hostname, interface_type)
+                 VALUES ($1, $2, 'Machine', $3, $4::macaddr, false, 'upgrade-status',
+                         $5::text::interface_type)",
+            )
+            .bind(machine_id)
+            .bind(dpu_id)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:20:{index:02x}"))
+            .bind(interface_type)
+            .execute(txn.as_mut())
+            .await?;
+            let status = super::find_dpu_agent_upgrade_status(txn.as_mut(), &dpu_id).await?;
+            assert_eq!(status.is_some(), attached, "{scenario}");
+        }
+        txn.commit().await?;
+
+        let mut reader = pool.begin().await?;
+        let status = super::find_dpu_agent_upgrade_status(reader.as_mut(), &dpu_id)
+            .await?
+            .expect("data interfaces attach the DPU");
+        assert_eq!(status.id, dpu_id);
+        assert_eq!(status.agent_version, None);
+        assert!(!status.upgrade_requested);
+        assert!(!status.host_dpf_used_for_ingestion);
+        reader.commit().await?;
+
+        let mut writer = pool.begin().await?;
+        let observation = model::machine::network::MachineNetworkStatusObservation {
+            machine_id: dpu_id,
+            agent_version: Some("v2026.10".to_string()),
+            observed_at: chrono::Utc::now(),
+            network_config_version: None,
+            client_certificate_expiry: None,
+            agent_version_superseded_at: None,
+            instance_network_observation: None,
+            fabric_interfaces: Vec::new(),
+        };
+        assert!(matches!(
+            super::update_network_status_observation(writer.as_mut(), &dpu_id, &observation)
+                .await?,
+            crate::ConditionalWrite::Applied(())
+        ));
+        super::set_dpu_agent_upgrade_requested(writer.as_mut(), &dpu_id, true, "v2026.11").await?;
+        super::mark_machine_ingestion_done_with_dpf(writer.as_mut(), &host_id).await?;
+        writer.commit().await?;
+
+        let mut reader = pool.begin().await?;
+        let status = super::find_dpu_agent_upgrade_status(reader.as_mut(), &dpu_id)
+            .await?
+            .expect("data interfaces still attach the DPU");
+        assert_eq!(status.agent_version.as_deref(), Some("v2026.10"));
+        assert!(status.upgrade_requested);
+        assert!(status.host_dpf_used_for_ingestion);
+        reader.commit().await?;
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn spx_multiplane_initializes_on_host_creation_only(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use model::expected_machine::{ExpectedInterface, ExpectedMachineData};
+        let data = ExpectedMachineData {
+            interfaces: vec![ExpectedInterface {
+                logical_ifname: Some("eth_r2_p6".to_string()),
+                physical_ifname: Some("C5-1-L3".to_string()),
+                nic_type: Some("CX9".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (id, expected) in [
+            (
+                "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30",
+                true,
+            ),
+            (
+                "fm100ds27v4uuq7sgs4gsjummskt0b3tedugtpevjrbfh6su081n9jufcq0",
+                false,
+            ),
+        ] {
+            let mut txn = pool.begin().await?;
+            let machine = super::create(
+                &mut txn,
+                None,
+                &id.parse::<MachineId>()?,
+                ManagedHostState::Ready,
+                Some(&data),
+                2,
+            )
+            .await?;
+            assert_eq!(machine.spx_multiplane.is_some(), expected);
+            if let Some(configuration) = machine.spx_multiplane {
+                assert!(
+                    configuration.interfaces["eth_r2_p6"]
+                        .cfg_maintenance_mode
+                        .is_none()
+                );
+            }
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// A retry may opt in after an earlier request omitted the option, but later
+    /// requests cannot cancel a wait once it has been recorded.
+    #[crate::sqlx_test]
+    async fn force_delete_ack_requirement_only_becomes_stricter(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::ForceDeletion,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        for (requested, expected) in [(false, false), (true, true), (false, true)] {
+            let mut txn = pool.begin().await?;
+            super::find_one(
+                txn.as_mut(),
+                &machine_id,
+                MachineSearchConfig {
+                    for_update: true,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .expect("fixture host must remain available");
+            assert_eq!(
+                super::record_force_delete_admin_ack_requirement(
+                    txn.as_mut(),
+                    &machine_id,
+                    requested,
+                )
+                .await?,
+                expected,
+            );
+            txn.commit().await?;
+            let stored: Option<bool> = sqlx::query_scalar(
+                "SELECT force_delete_requires_admin_ack FROM machines WHERE id = $1",
+            )
+            .bind(machine_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(stored, Some(expected));
+        }
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn machine_observations_compare_timestamps_chronologically(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use model::machine::infiniband::MachineInfinibandStatusObservation;
+        use model::machine::nvlink::MachineNvLinkStatusObservation;
+        use model::machine::spx::MachineSpxStatusObservation;
+        use model::machine::status::MlxDeviceObservation;
+
+        use super::{
+            MachineObservationNotCurrent, update_infiniband_status_observation,
+            update_mlx_device_observation, update_nvlink_status_observation,
+            update_spx_status_observation,
+        };
+        use crate::ConditionalWrite::{Applied, NotApplied};
+
+        struct Case {
+            scenario: &'static str,
+            stored_at: Option<&'static str>,
+            observed_at: &'static str,
+            applies: bool,
+        }
+
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            &mut txn,
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+
+        // Each column has its own SQL predicate. Check persisted JSON, not only
+        // the result, so a rejected observation cannot replace newer data.
+        // Only the literal column names below are interpolated into SQL.
+        for column in [
+            "infiniband_status_observation",
+            "nvlink_status_observation",
+            "spx_status_observation",
+            "mlx_device_observation",
+        ] {
+            for Case {
+                scenario,
+                stored_at,
+                observed_at,
+                applies,
+            } in [
+                Case {
+                    scenario: "first observation",
+                    stored_at: None,
+                    observed_at: "2026-09-16T16:00:00.123Z",
+                    applies: true,
+                },
+                Case {
+                    scenario: "newer with more fractional digits",
+                    stored_at: Some("2026-09-16T16:00:00.123Z"),
+                    observed_at: "2026-09-16T16:00:00.123001+00:00",
+                    applies: true,
+                },
+                Case {
+                    scenario: "equal nanosecond timestamp",
+                    stored_at: Some("2026-09-16T16:00:00.123456789Z"),
+                    observed_at: "2026-09-16T16:00:00.123456789+00:00",
+                    applies: true,
+                },
+                Case {
+                    scenario: "older timestamp with a different offset",
+                    stored_at: Some("2026-09-16T15:00:00.123001-01:00"),
+                    observed_at: "2026-09-16T16:00:00.123Z",
+                    applies: false,
+                },
+            ] {
+                let stored =
+                    stored_at.map(|timestamp| serde_json::json!({"observed_at": timestamp}));
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE machines SET {column} = $1 WHERE id = $2"
+                )))
+                .bind(stored.as_ref().map(sqlx::types::Json))
+                .bind(machine_id)
+                .execute(txn.as_mut())
+                .await?;
+                let observed_at = observed_at.parse()?;
+                let (result, incoming) = match column {
+                    "infiniband_status_observation" => {
+                        let observation = MachineInfinibandStatusObservation {
+                            observed_at,
+                            ib_interfaces: Vec::new(),
+                        };
+                        (
+                            update_infiniband_status_observation(
+                                txn.as_mut(),
+                                &machine_id,
+                                &observation,
+                            )
+                            .await?,
+                            serde_json::to_value(observation)?,
+                        )
+                    }
+                    "nvlink_status_observation" => {
+                        let observation = MachineNvLinkStatusObservation {
+                            observed_at,
+                            nvlink_gpus: Vec::new(),
+                        };
+                        (
+                            update_nvlink_status_observation(
+                                txn.as_mut(),
+                                &machine_id,
+                                &observation,
+                            )
+                            .await?,
+                            serde_json::to_value(observation)?,
+                        )
+                    }
+                    "spx_status_observation" => {
+                        let observation = MachineSpxStatusObservation {
+                            observed_at,
+                            spx_attachments: Vec::new(),
+                        };
+                        (
+                            update_spx_status_observation(txn.as_mut(), &machine_id, &observation)
+                                .await?,
+                            serde_json::to_value(observation)?,
+                        )
+                    }
+                    "mlx_device_observation" => {
+                        let observation = MlxDeviceObservation {
+                            observed_at,
+                            devices: Vec::new(),
+                        };
+                        (
+                            update_mlx_device_observation(txn.as_mut(), &machine_id, &observation)
+                                .await?,
+                            serde_json::to_value(observation)?,
+                        )
+                    }
+                    _ => unreachable!("the table contains only observation columns"),
+                };
+                assert_eq!(
+                    result,
+                    if applies {
+                        Applied(())
+                    } else {
+                        NotApplied(MachineObservationNotCurrent)
+                    },
+                    "{column}: {scenario}"
+                );
+                let persisted: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                    format!("SELECT {column} FROM machines WHERE id = $1"),
+                ))
+                .bind(machine_id)
+                .fetch_one(txn.as_mut())
+                .await?;
+                assert_eq!(
+                    persisted,
+                    if applies { incoming } else { stored.unwrap() },
+                    "{column}: {scenario}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn clearing_nvlink_observations_writes_only_rows_holding_one(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{DateTime, Utc};
+
+        use super::clear_nvlink_status_observations;
+
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            &mut txn,
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        // The `updated` trigger stamps NOW(), which is constant inside one
+        // transaction, so every step commits before the row is read back.
+        async fn clear_in_own_transaction(
+            pool: &sqlx::PgPool,
+            machine_id: HostMachineId,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut txn = pool.begin().await?;
+            clear_nvlink_status_observations(txn.as_mut(), &[machine_id]).await?;
+            txn.commit().await?;
+            Ok(())
+        }
+        async fn row(
+            pool: &sqlx::PgPool,
+            machine_id: &HostMachineId,
+        ) -> Result<(Option<serde_json::Value>, DateTime<Utc>), Box<dyn std::error::Error>>
+        {
+            Ok(sqlx::query_as(
+                "SELECT nvlink_status_observation, updated FROM machines WHERE id = $1",
+            )
+            .bind(machine_id)
+            .fetch_one(pool)
+            .await?)
+        }
+
+        let (_, updated_before) = row(&pool, &machine_id).await?;
+        clear_in_own_transaction(&pool, machine_id).await?;
+        let (observation, updated_after) = row(&pool, &machine_id).await?;
+        assert_eq!(observation, None);
+        assert_eq!(
+            updated_after, updated_before,
+            "a row already holding NULL must not be rewritten"
+        );
+
+        sqlx::query("UPDATE machines SET nvlink_status_observation = $1 WHERE id = $2")
+            .bind(sqlx::types::Json(
+                serde_json::json!({"observed_at": "2026-09-16T16:00:00Z", "nvlink_gpus": []}),
+            ))
+            .bind(machine_id)
+            .execute(&pool)
+            .await?;
+        let (observation, updated_before) = row(&pool, &machine_id).await?;
+        assert!(observation.is_some());
+        clear_in_own_transaction(&pool, machine_id).await?;
+        let (observation, updated_after) = row(&pool, &machine_id).await?;
+        assert_eq!(observation, None);
+        assert!(
+            updated_after > updated_before,
+            "a cleared row is a new row version"
+        );
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn mlx_observation_round_trips_through_machine_snapshot(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use model::machine::status::MlxDeviceObservation;
+
+        use super::{MachineObservationNotCurrent, update_mlx_device_observation};
+        use crate::ConditionalWrite::{Applied, NotApplied};
+
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let observation: MlxDeviceObservation = serde_json::from_value(serde_json::json!({
+            "observed_at": "2026-09-16T16:00:00.123456789Z",
+            "devices": [
+                {
+                    "pci_name": "0000:01:00.0",
+                    "device_type": "ConnectX8",
+                    "psid": "MT_0000001111",
+                    "part_number": "MCX813106AS-VEA",
+                    "fw_version_current": "40.45.1000"
+                },
+                {
+                    "pci_name": "0000:b4:00.0",
+                    "device_type": "BlueField3",
+                    "status": "Failed to open device"
+                }
+            ]
+        }))?;
+        let mut txn = pool.begin().await?;
+        assert_eq!(
+            update_mlx_device_observation(txn.as_mut(), &machine_id, &observation).await?,
+            NotApplied(MachineObservationNotCurrent),
+            "a missing machine cannot accept an observation"
+        );
+        let machine = super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        assert_eq!(machine.status.mlx_device_observation, None);
+        assert_eq!(
+            update_mlx_device_observation(txn.as_mut(), &machine_id, &observation).await?,
+            Applied(())
+        );
+        txn.commit().await?;
+
+        let machine = super::find_one(&pool, &machine_id, MachineSearchConfig::default())
+            .await?
+            .expect("fixture host");
+        assert_eq!(machine.status.mlx_device_observation, Some(observation));
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn concurrent_mlx_observations_preserve_newer_report(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use model::machine::status::MlxDeviceObservation;
+
+        use super::{MachineObservationNotCurrent, update_mlx_device_observation};
+        use crate::ConditionalWrite::{Applied, NotApplied};
+
+        let machine_id: HostMachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        let newer = MlxDeviceObservation {
+            observed_at: "2026-09-16T16:00:01Z".parse()?,
+            devices: Vec::new(),
+        };
+        let older = MlxDeviceObservation {
+            observed_at: "2026-09-16T16:00:00Z".parse()?,
+            devices: Vec::new(),
+        };
+        let mut newer_txn = pool.begin().await?;
+        assert_eq!(
+            update_mlx_device_observation(newer_txn.as_mut(), &machine_id, &newer).await?,
+            Applied(())
+        );
+        let mut older_txn = pool.begin().await?;
+        let release_newer = async {
+            // The older write must reach the locked row before the newer
+            // report commits, so its predicate must be rechecked after waiting.
+            wait_until_blocked_on(&pool, "UPDATE machines SET mlx_device_observation", 1).await;
+            newer_txn.commit().await
+        };
+        let (older_result, released) =
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                tokio::join!(
+                    update_mlx_device_observation(older_txn.as_mut(), &machine_id, &older),
+                    release_newer,
+                )
+            })
+            .await
+            .expect("the older observation must finish after the newer transaction commits");
+        released?;
+        assert_eq!(older_result?, NotApplied(MachineObservationNotCurrent));
+        older_txn.commit().await?;
+
+        let machine = super::find_one(&pool, &machine_id, MachineSearchConfig::default())
+            .await?
+            .expect("fixture host");
+        assert_eq!(machine.status.mlx_device_observation, Some(newer));
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn network_observations_compare_fractional_timestamps(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use carbide_uuid::machine::DpuMachineId;
+        use chrono::{DateTime, Duration, Utc};
+        use model::machine::network::MachineNetworkStatusObservation;
+
+        use super::{MachineObservationNotCurrent, update_network_status_observation};
+        use crate::ConditionalWrite::{self, Applied, NotApplied};
+
+        let machine_id: DpuMachineId =
+            "fm100ds7blqjsadm2uuh3qqbf1h7k8pmf47um6v9uckrg7l03po8mhqgvng".parse()?;
+        let observed_at = DateTime::from_timestamp(1_722_000_000, 123_456_789).unwrap();
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        struct Case {
+            scenario: &'static str,
+            observed_at: DateTime<Utc>,
+            expect: ConditionalWrite<(), MachineObservationNotCurrent>,
+        }
+        let mut expected = None;
+        for case in [
+            Case {
+                scenario: "first observation",
+                observed_at,
+                expect: Applied(()),
+            },
+            Case {
+                scenario: "equal timestamp replaces the payload",
+                observed_at,
+                expect: Applied(()),
+            },
+            Case {
+                scenario: "older observation preserves the payload",
+                observed_at: observed_at - Duration::microseconds(1),
+                expect: NotApplied(MachineObservationNotCurrent),
+            },
+        ] {
+            let observation = MachineNetworkStatusObservation {
+                machine_id,
+                agent_version: Some(case.scenario.to_string()),
+                observed_at: case.observed_at,
+                network_config_version: None,
+                client_certificate_expiry: None,
+                agent_version_superseded_at: None,
+                instance_network_observation: None,
+                fabric_interfaces: Vec::new(),
+            };
+            let mut txn = pool.begin().await?;
+            let result =
+                update_network_status_observation(txn.as_mut(), &machine_id, &observation).await?;
+            txn.commit().await?;
+            assert_eq!(result, case.expect, "{}", case.scenario);
+            if let Applied(()) = case.expect {
+                expected = Some(observation);
+            }
+            let persisted: sqlx::types::Json<MachineNetworkStatusObservation> =
+                sqlx::query_scalar("SELECT network_status_observation FROM machines WHERE id = $1")
+                    .bind(machine_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(Some(persisted.0), expected, "{}", case.scenario);
+        }
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn extension_service_observations_preserve_per_service_timestamp_order(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{DateTime, Utc};
+        use config_version::ConfigVersion;
+        use model::extension_service::ExtensionServiceType;
+        use model::instance::status::extension_service::{
+            InstanceExtensionServiceStatusObservation,
+            InstanceExtensionServiceStatusObservationByType,
+        };
+
+        use super::{
+            ExtensionServiceObservationNotCurrent, update_extension_service_status_observation,
+        };
+        use crate::ConditionalWrite::{self, Applied, NotApplied};
+
+        let machine_id =
+            MachineId::from_str("fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30")?;
+        let observation = InstanceExtensionServiceStatusObservation {
+            config_version: ConfigVersion::initial(),
+            instance_config_version: None,
+            extension_service_statuses: Vec::new(),
+            observed_at: DateTime::from_timestamp(1_722_000_000, 123_456_789).unwrap(),
+        };
+        let mut txn = pool.begin().await?;
+        let missing = update_extension_service_status_observation(
+            txn.as_mut(),
+            &machine_id,
+            ExtensionServiceType::KubernetesPod,
+            &observation,
+        )
+        .await;
+        assert!(
+            matches!(missing, Err(crate::DatabaseError::NotFoundError { kind: "machine", id }) if id == machine_id.to_string())
+        );
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        struct Case {
+            scenario: &'static str,
+            service_type: ExtensionServiceType,
+            observed_at: DateTime<Utc>,
+            config_version: ConfigVersion,
+            expect: ConditionalWrite<(), ExtensionServiceObservationNotCurrent>,
+        }
+        let mut expected = InstanceExtensionServiceStatusObservationByType::default();
+        for case in [
+            Case {
+                scenario: "initial observation",
+                service_type: ExtensionServiceType::KubernetesPod,
+                observed_at: observation.observed_at,
+                config_version: observation.config_version,
+                expect: Applied(()),
+            },
+            Case {
+                scenario: "another service has an independent timestamp",
+                service_type: ExtensionServiceType::DpfHelmChart,
+                observed_at: observation.observed_at - chrono::Duration::seconds(1),
+                config_version: observation.config_version,
+                expect: Applied(()),
+            },
+            Case {
+                scenario: "older observation leaves both services unchanged",
+                service_type: ExtensionServiceType::KubernetesPod,
+                observed_at: observation.observed_at - chrono::Duration::seconds(1),
+                config_version: observation.config_version.increment(),
+                expect: NotApplied(ExtensionServiceObservationNotCurrent),
+            },
+            Case {
+                scenario: "equal timestamp can replace the payload",
+                service_type: ExtensionServiceType::KubernetesPod,
+                observed_at: observation.observed_at,
+                config_version: observation.config_version.increment(),
+                expect: Applied(()),
+            },
+        ] {
+            let incoming = InstanceExtensionServiceStatusObservation {
+                config_version: case.config_version,
+                observed_at: case.observed_at,
+                ..observation.clone()
+            };
+            let mut txn = pool.begin().await?;
+            let result = update_extension_service_status_observation(
+                txn.as_mut(),
+                &machine_id,
+                case.service_type.clone(),
+                &incoming,
+            )
+            .await?;
+            txn.commit().await?;
+            assert_eq!(result, case.expect, "{}", case.scenario);
+            if let Applied(()) = case.expect {
+                expected.set_for_service_type(case.service_type, incoming);
+            }
+            let persisted: sqlx::types::Json<InstanceExtensionServiceStatusObservationByType> =
+                sqlx::query_scalar(
+                    "SELECT extension_service_status_observations FROM machines WHERE id = $1",
+                )
+                .bind(machine_id)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(persisted.0, expected, "{}", case.scenario);
+        }
+        Ok(())
+    }
 
     fn common_pools_without_seeded_values() -> CommonPools {
-        let (stop_sender, _stop_receiver) = oneshot::channel();
         CommonPools {
             ethernet: EthernetPools {
                 pool_loopback_ip: Arc::new(ResourcePool::new(
@@ -3410,8 +5290,6 @@ mod test {
                 )),
             },
             infiniband: IbPools::default(),
-            pool_stats: Arc::new(Mutex::new(HashMap::new())),
-            _stop_sender: stop_sender,
         }
     }
 
@@ -3419,22 +5297,11 @@ mod test {
     async fn syncing_stable_id_cascades_dpa_interfaces_to_stable_id(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use carbide_uuid::machine::{MachineIdSource, MachineType};
         use mac_address::MacAddress;
         use model::dpa_interface::{DpaInterfaceType, DpaSearchConfig, NewDpaInterface};
 
-        fn machine_id(marker: u8, machine_type: MachineType) -> MachineId {
-            let mut hardware_id = [0u8; 32];
-            hardware_id[0] = marker;
-            MachineId::new(
-                MachineIdSource::ProductBoardChassisSerial,
-                hardware_id,
-                machine_type,
-            )
-        }
-
-        let predicted_id = machine_id(1, MachineType::PredictedHost);
-        let stable_id = machine_id(1, MachineType::Host);
+        let predicted_id = HostMachineId::try_from(machine_id(1, MachineType::PredictedHost))?;
+        let stable_id = StableHostMachineId::try_from(machine_id(1, MachineType::Host))?;
 
         let mut txn = pool.begin().await?;
 
@@ -3467,7 +5334,7 @@ mod test {
         // rows reference the old id: the ON UPDATE CASCADE FK moves them.
         let renamed = super::try_sync_stable_id_with_current_machine_id_for_host(
             &mut txn,
-            &Some(predicted_id),
+            Some(predicted_id),
             &stable_id,
         )
         .await?;
@@ -3486,7 +5353,7 @@ mod test {
 
         let under_stable = crate::dpa_interface::find_by_machine_id(
             txn.as_mut(),
-            stable_id,
+            stable_id.to_host_machine_id(),
             DpaSearchConfig::default(),
         )
         .await?;
@@ -3499,10 +5366,322 @@ mod test {
         Ok(())
     }
 
+    /// The pre-lock holds every interface row of the host, BMC row included,
+    /// and its machines row, and no other machine's rows, before the rename
+    /// rewrites them.
     #[crate::sqlx_test]
-    async fn cleanup_time_follows_state_committed_after_transaction_start(
+    async fn lock_rows_for_stable_id_sync_holds_the_host_interface_and_machines_rows(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use carbide_uuid::machine::{MachineIdSource, MachineType, PredictedHostMachineId};
+
+        fn machine_id(marker: u8, machine_type: MachineType) -> MachineId {
+            let mut hardware_id = [0u8; 32];
+            hardware_id[0] = marker;
+            MachineId::new(
+                MachineIdSource::ProductBoardChassisSerial,
+                hardware_id,
+                machine_type,
+            )
+        }
+
+        /// Whether `query`, a `FOR UPDATE NOWAIT` of the row with the text
+        /// id `id`, fails because another transaction holds the row.
+        async fn row_is_held(pool: &sqlx::PgPool, query: &'static str, id: &str) -> bool {
+            let mut probe = pool.begin().await.unwrap();
+            let result = sqlx::query(query).bind(id).fetch_one(probe.as_mut()).await;
+            probe.rollback().await.unwrap();
+            match result {
+                Ok(_) => false,
+                Err(error) => {
+                    assert_eq!(
+                        error
+                            .as_database_error()
+                            .and_then(sqlx::error::DatabaseError::code)
+                            .as_deref(),
+                        Some("55P03"),
+                        "{error}"
+                    );
+                    true
+                }
+            }
+        }
+        const INTERFACE_HELD: &str =
+            "SELECT id FROM machine_interfaces WHERE id = $1::uuid FOR UPDATE NOWAIT";
+        const MACHINE_HELD: &str = "SELECT id FROM machines WHERE id = $1 FOR UPDATE NOWAIT";
+
+        let predicted_id =
+            PredictedHostMachineId::try_from(machine_id(1, MachineType::PredictedHost))?;
+        let stable_id = StableHostMachineId::try_from(machine_id(1, MachineType::Host))?;
+        let other_machine_id = machine_id(2, MachineType::Host);
+
+        let mut setup = pool.begin().await?;
+        for id in [MachineId::from(predicted_id), other_machine_id] {
+            super::create(setup.as_mut(), None, &id, ManagedHostState::Ready, None, 2).await?;
+        }
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version) VALUES ('stable-id-sync', 'V1-T0')
+             RETURNING id",
+        )
+        .fetch_one(setup.as_mut())
+        .await?;
+        let mut interface_ids = Vec::new();
+        for (index, (owner, interface_type)) in [
+            (MachineId::from(predicted_id), "Data"),
+            (MachineId::from(predicted_id), "Bmc"),
+            (MachineId::from(predicted_id), "Data"),
+            (other_machine_id, "Data"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let interface_id: MachineInterfaceId = sqlx::query_scalar(
+                "INSERT INTO machine_interfaces
+                     (machine_id, association_type, segment_id, mac_address,
+                      primary_interface, hostname, interface_type)
+                 VALUES ($1, 'Machine', $2, $3::macaddr, false, $4, $5::interface_type)
+                 RETURNING id",
+            )
+            .bind(owner)
+            .bind(segment_id)
+            .bind(format!("02:00:00:00:00:0{index}"))
+            .bind(format!("stable-id-sync-{index}"))
+            .bind(interface_type)
+            .fetch_one(setup.as_mut())
+            .await?;
+            interface_ids.push(interface_id);
+        }
+        let other_interface_id = interface_ids.pop().expect("four rows were inserted");
+        setup.commit().await?;
+
+        let mut txn = pool.begin().await?;
+        super::lock_rows_for_stable_id_sync(&mut txn, &predicted_id).await?;
+
+        for interface_id in &interface_ids {
+            assert!(
+                row_is_held(&pool, INTERFACE_HELD, &interface_id.to_string()).await,
+                "interface row {interface_id} of the predicted host should be held"
+            );
+        }
+        assert!(
+            row_is_held(&pool, MACHINE_HELD, &predicted_id.to_string()).await,
+            "the machines row of the predicted host should be held"
+        );
+        assert!(
+            !row_is_held(&pool, INTERFACE_HELD, &other_interface_id.to_string()).await,
+            "another machine's interface row should be free"
+        );
+
+        let renamed = super::try_sync_stable_id_with_current_machine_id_for_host(
+            &mut txn,
+            Some(HostMachineId::from(predicted_id)),
+            &stable_id,
+        )
+        .await?;
+        assert_eq!(renamed, stable_id);
+        let mut renamed_rows: Vec<MachineInterfaceId> =
+            sqlx::query_scalar("SELECT id FROM machine_interfaces WHERE machine_id = $1")
+                .bind(stable_id)
+                .fetch_all(txn.as_mut())
+                .await?;
+        renamed_rows.sort();
+        interface_ids.sort();
+        assert_eq!(renamed_rows, interface_ids);
+        txn.rollback().await?;
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn reboot_verification_waits_for_a_concurrent_request(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use super::{MachineLastRebootRequested, MachineLastRebootRequestedMode};
+
+        let machine_id: MachineId =
+            "fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30".parse()?;
+        let captured = MachineLastRebootRequested {
+            time: chrono::DateTime::from_timestamp(1_722_000_000, 0).unwrap(),
+            mode: MachineLastRebootRequestedMode::Reboot,
+            restart_verified: Some(false),
+            verification_attempts: Some(0),
+        };
+        let mut setup = pool.begin().await?;
+        super::create(
+            setup.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            super::CURRENT_STATE_MODEL_VERSION,
+        )
+        .await?;
+        super::record_reboot_request(&machine_id, setup.as_mut(), &captured).await?;
+        setup.commit().await?;
+
+        let newer = MachineLastRebootRequested {
+            time: captured.time + chrono::Duration::seconds(1),
+            ..captured
+        };
+        let mut replacement = pool.begin().await?;
+        super::record_reboot_request(&machine_id, replacement.as_mut(), &newer).await?;
+
+        let verify = async {
+            let mut txn = pool.begin().await?;
+            let result = super::update_restart_verification_status(
+                &machine_id,
+                captured,
+                Some(true),
+                1,
+                &mut txn,
+            )
+            .await?;
+            txn.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(result)
+        };
+        let commit_replacement = async {
+            // The new request is still uncommitted. Verification must wait at
+            // its locking read, then compare against the newly committed value.
+            // Without that lock, it reads the old value and only its UPDATE waits.
+            wait_until_blocked_on(&pool, "last_reboot_requested", 1).await;
+            replacement.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(verify, commit_replacement)
+        })
+        .await??;
+        assert_eq!(
+            result,
+            crate::ConditionalWrite::NotApplied(super::RebootVerificationNotCurrent)
+        );
+        let stored: sqlx::types::Json<MachineLastRebootRequested> =
+            sqlx::query_scalar("SELECT last_reboot_requested FROM machines WHERE id=$1")
+                .bind(machine_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(stored.0, newer);
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn controller_state_persistence_preserves_advance_lock_order(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let machine_id =
+            MachineId::from_str("fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30")?;
+        let host_id = HostMachineId::try_from(machine_id)?;
+        let mut setup_txn = pool.begin().await?;
+        super::create(
+            setup_txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+        setup_txn.commit().await?;
+
+        let mut legacy_txn = pool.begin().await?;
+        let machine = super::find_one(
+            legacy_txn.as_mut(),
+            &host_id,
+            MachineSearchConfig::default(),
+        )
+        .await?
+        .expect("fixture host");
+        let expected_version = machine.state.version;
+        let new_version = expected_version.increment();
+        let legacy_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(legacy_txn.as_mut())
+            .await?;
+
+        // Pause the legacy writer at the retention lock taken by `advance`.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1, 'machine_state_history'::regclass::bigint)\
+            )",
+        )
+        .bind(host_id.to_string())
+        .execute(legacy_txn.as_mut())
+        .await?;
+
+        let mut controller_txn = pool.begin().await?;
+        let controller_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(controller_txn.as_mut())
+            .await?;
+        let controller_write = async {
+            let applied = super::try_update_controller_state(
+                controller_txn.as_mut(),
+                &host_id,
+                expected_version,
+                new_version,
+                &ManagedHostState::Ready,
+            )
+            .await?;
+            controller_txn.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(applied)
+        };
+        let legacy_write = async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE pid = $1 AND locktype = 'advisory' AND NOT granted
+                          AND $2 = ANY(pg_blocking_pids(pid))
+                    )",
+                )
+                .bind(controller_pid)
+                .bind(legacy_pid)
+                .fetch_one(&pool)
+                .await?;
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            // Waiting for history must not hold the host row. NOWAIT catches
+            // the reversed order without relying on a deadlock victim.
+            sqlx::query("SELECT id FROM machines WHERE id = $1 FOR UPDATE NOWAIT")
+                .bind(host_id)
+                .fetch_one(legacy_txn.as_mut())
+                .await?;
+            super::advance(
+                &machine,
+                legacy_txn.as_mut(),
+                &ManagedHostState::ForceDeletion,
+                Some(new_version),
+            )
+            .await?;
+            legacy_txn.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (applied, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(controller_write, legacy_write)
+        })
+        .await??;
+        assert_eq!(
+            applied,
+            crate::ConditionalWrite::NotApplied(crate::ControllerStateNotCurrent),
+            "the controller must reject the earlier snapshot"
+        );
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn completion_markers_follow_state_committed_after_transaction_start(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone, Copy)]
+        enum CompletionMarker {
+            Cleanup,
+            Discovery,
+            MachineValidation,
+            Reboot,
+        }
+
         let machine_id =
             MachineId::from_str("fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30")?;
         let mut setup_txn = pool.begin().await?;
@@ -3517,66 +5696,92 @@ mod test {
         .await?;
         setup_txn.commit().await?;
 
-        let mut cleanup_txn = pool.begin().await?;
-        let cleanup_transaction_started_at: chrono::DateTime<chrono::Utc> =
-            sqlx::query_scalar("SELECT transaction_timestamp()")
-                .fetch_one(cleanup_txn.as_mut())
-                .await?;
-        let machine = super::find_one(
-            cleanup_txn.as_mut(),
-            &machine_id,
-            MachineSearchConfig::default(),
-        )
-        .await?
-        .expect("machine should exist before recording cleanup");
+        for (case, marker) in [
+            ("cleanup", CompletionMarker::Cleanup),
+            ("discovery", CompletionMarker::Discovery),
+            ("machine validation", CompletionMarker::MachineValidation),
+            ("reboot", CompletionMarker::Reboot),
+        ] {
+            let mut marker_txn = pool.begin().await?;
+            let marker_transaction_started_at: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT transaction_timestamp()")
+                    .fetch_one(marker_txn.as_mut())
+                    .await?;
+            let machine = super::find_one(
+                marker_txn.as_mut(),
+                &machine_id,
+                MachineSearchConfig::default(),
+            )
+            .await?
+            .unwrap_or_else(|| panic!("{case}: machine should exist before recording completion"));
 
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        let mut state_txn = pool.begin().await?;
-        let machine_for_state_update = super::find_one(
-            state_txn.as_mut(),
-            &machine_id,
-            MachineSearchConfig::default(),
-        )
-        .await?
-        .expect("machine should exist before advancing its state version");
-        super::advance(
-            &machine_for_state_update,
-            state_txn.as_mut(),
-            &ManagedHostState::Ready,
-            None,
-        )
-        .await?;
-        state_txn.commit().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let mut state_txn = pool.begin().await?;
+            let machine_for_state_update = super::find_one(
+                state_txn.as_mut(),
+                &machine_id,
+                MachineSearchConfig::default(),
+            )
+            .await?
+            .unwrap_or_else(|| {
+                panic!("{case}: machine should exist before advancing its state version")
+            });
+            super::advance(
+                &machine_for_state_update,
+                state_txn.as_mut(),
+                &ManagedHostState::Ready,
+                None,
+            )
+            .await?;
+            state_txn.commit().await?;
 
-        super::update_cleanup_time(&machine, cleanup_txn.as_mut()).await?;
-        cleanup_txn.commit().await?;
+            match marker {
+                CompletionMarker::Cleanup => {
+                    super::update_cleanup_time(&machine, marker_txn.as_mut()).await?
+                }
+                CompletionMarker::Discovery => {
+                    super::update_discovery_time(&machine.id, marker_txn.as_mut()).await?
+                }
+                CompletionMarker::MachineValidation => {
+                    super::update_machine_validation_time(&machine.id, marker_txn.as_mut()).await?
+                }
+                CompletionMarker::Reboot => {
+                    super::update_reboot_time(&machine, marker_txn.as_mut()).await?
+                }
+            }
+            marker_txn.commit().await?;
 
-        let mut verify_txn = pool.begin().await?;
-        let machine = super::find_one(
-            verify_txn.as_mut(),
-            &machine_id,
-            MachineSearchConfig::default(),
-        )
-        .await?
-        .expect("machine should exist after recording cleanup");
-        let cleanup_time = machine
-            .status
-            .last_cleanup_time
-            .expect("cleanup time should be recorded");
-        assert!(
-            cleanup_transaction_started_at < machine.state.version.timestamp(),
-            "the test must start the cleanup transaction before advancing the state version"
-        );
-        assert!(
-            cleanup_time > machine.state.version.timestamp(),
-            "cleanup recorded after a state transition must be newer than that state version"
-        );
+            let mut verify_txn = pool.begin().await?;
+            let machine = super::find_one(
+                verify_txn.as_mut(),
+                &machine_id,
+                MachineSearchConfig::default(),
+            )
+            .await?
+            .unwrap_or_else(|| panic!("{case}: machine should exist after recording completion"));
+            let marker_time = match marker {
+                CompletionMarker::Cleanup => machine.status.last_cleanup_time,
+                CompletionMarker::Discovery => machine.status.last_discovery_time,
+                CompletionMarker::MachineValidation => machine.last_machine_validation_time,
+                CompletionMarker::Reboot => machine.status.last_reboot_time,
+            }
+            .unwrap_or_else(|| panic!("{case}: completion time should be recorded"));
+            assert!(
+                marker_transaction_started_at < machine.state.version.timestamp(),
+                "{case}: the marker transaction must start before advancing the state version"
+            );
+            assert!(
+                marker_time > machine.state.version.timestamp(),
+                "{case}: completion recorded after a state transition must be newer than that state version"
+            );
+            verify_txn.commit().await?;
+        }
 
         Ok(())
     }
 
     #[crate::sqlx_test]
-    async fn dpu_creation_keeps_exhausted_fnn_asn_nonfatal(
+    async fn dpu_creation_keeps_unavailable_fnn_asn_nonfatal(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         const RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC: &str =
@@ -3585,50 +5790,149 @@ mod test {
         let common_pools = common_pools_without_seeded_values();
         let dpu_id =
             MachineId::from_str("fm100ds7blqjsadm2uuh3qqbf1h7k8pmf47um6v9uckrg7l03po8mhqgvng")?;
-        let mut connection = pool.acquire().await?;
-        let metrics = MetricsCapture::start();
+        for (scenario, exhaust_pool, expected_failure) in [
+            ("exhausted", true, "exhausted"),
+            ("unconfigured", false, "configuration"),
+        ] {
+            let mut txn = pool.begin().await?;
+            let asn_pool = &common_pools.ethernet.pool_fnn_asn;
+            if exhaust_pool {
+                crate::resource_pool::populate(asn_pool, txn.as_mut(), vec![64512], true).await?;
+                crate::resource_pool::allocate(
+                    asn_pool,
+                    txn.as_mut(),
+                    model::resource_pool::OwnerType::Machine,
+                    "existing-dpu",
+                    None,
+                )
+                .await?;
+            }
+            let stats = crate::resource_pool::stats(txn.as_mut(), asn_pool.name()).await?;
+            assert_eq!(
+                (stats.auto_assign_free, stats.auto_assign_used),
+                (0, usize::from(exhaust_pool)),
+                "{scenario}: verify the pool state before creating the DPU"
+            );
+            let metrics = MetricsCapture::start();
 
-        let (machine, logs) = capture_logs_async(super::create(
-            connection.as_mut(),
-            Some(&common_pools),
+            let (machine, logs) = capture_logs_async(super::create(
+                txn.as_mut(),
+                Some(&common_pools),
+                &dpu_id,
+                ManagedHostState::Ready,
+                None,
+                2,
+            ))
+            .await;
+            let machine = machine?;
+
+            assert_eq!(machine.asn, None, "{scenario}");
+            let event_logs = logs
+                .iter()
+                .filter(|log| log.metadata_name == "dpu_asn_allocation_failed")
+                .collect::<Vec<_>>();
+            assert_eq!(event_logs.len(), 1, "{scenario}");
+            let log = event_logs[0];
+            assert_eq!(log.level, tracing::Level::INFO, "{scenario}");
+            assert_eq!(log.message, "Failed to allocate asn for dpu", "{scenario}");
+            assert_eq!(
+                log.field("stable_machine_id"),
+                Some(dpu_id.to_string().as_str()),
+                "{scenario}"
+            );
+            assert_eq!(log.field("failure"), Some(expected_failure), "{scenario}");
+            assert_eq!(
+                log.field("failure_policy"),
+                Some("best_effort"),
+                "{scenario}"
+            );
+            assert_eq!(
+                log.field("allocation_mode"),
+                Some("automatic"),
+                "{scenario}"
+            );
+            assert_eq!(
+                metrics.counter_delta(
+                    RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
+                    &[
+                        ("operation", "allocate"),
+                        ("failure", expected_failure),
+                        ("failure_policy", "best_effort"),
+                        ("allocation_mode", "automatic"),
+                        ("value_type", "integer"),
+                    ],
+                ),
+                1.0,
+                "{scenario}"
+            );
+            txn.rollback().await?;
+        }
+
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn concurrent_asn_backfills_leave_one_reservation(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let common_pools = common_pools(&pool, None).await?;
+        let dpu_id =
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")?;
+        let mut txn = pool.begin().await?;
+        super::create(
+            txn.as_mut(),
+            None,
             &dpu_id,
             ManagedHostState::Ready,
             None,
             2,
+        )
+        .await?;
+        txn.commit().await?;
+
+        let mut machine_lock = pool.begin().await?;
+        sqlx::query("SELECT id FROM machines WHERE id = $1 FOR UPDATE")
+            .bind(dpu_id)
+            .fetch_one(machine_lock.as_mut())
+            .await?;
+
+        let release_machine = async {
+            // Both backfills must reserve an ASN and reach the machine update
+            // before either can assign it. The losing reservation must be freed.
+            wait_until_blocked_on(&pool, "UPDATE machines set asn=", 2).await;
+            machine_lock.commit().await
+        };
+        let (first, second, released) =
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                tokio::join!(
+                    super::update_dpu_asns(&pool, &common_pools),
+                    super::update_dpu_asns(&pool, &common_pools),
+                    release_machine,
+                )
+            })
+            .await
+            .expect("both ASN backfills must finish after the machine lock is released");
+        first?;
+        second?;
+        released?;
+
+        let assigned: i64 = sqlx::query_scalar("SELECT asn FROM machines WHERE id = $1")
+            .bind(dpu_id)
+            .fetch_one(&pool)
+            .await?;
+        let reserved: Vec<i64> = sqlx::query_scalar(
+            "SELECT value::bigint FROM resource_pool WHERE name = $1 AND state = $2",
+        )
+        .bind(FNN_ASN)
+        .bind(sqlx::types::Json(
+            model::resource_pool::ResourcePoolEntryState::Allocated {
+                owner: dpu_id.to_string(),
+                owner_type: model::resource_pool::OwnerType::Machine.to_string(),
+            },
         ))
-        .await;
-        let machine = machine?;
-
-        assert_eq!(machine.asn, None);
-        let event_logs = logs
-            .iter()
-            .filter(|log| log.metadata_name == "dpu_asn_allocation_failed")
-            .collect::<Vec<_>>();
-        assert_eq!(event_logs.len(), 1);
-        let log = event_logs[0];
-        assert_eq!(log.level, tracing::Level::INFO);
-        assert_eq!(log.message, "Failed to allocate asn for dpu");
-        assert_eq!(
-            log.field("stable_machine_id"),
-            Some(dpu_id.to_string().as_str())
-        );
-        assert_eq!(log.field("failure"), Some("exhausted"));
-        assert_eq!(log.field("failure_policy"), Some("best_effort"));
-        assert_eq!(log.field("allocation_mode"), Some("automatic"));
-        assert_eq!(
-            metrics.counter_delta(
-                RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
-                &[
-                    ("operation", "allocate"),
-                    ("failure", "exhausted"),
-                    ("failure_policy", "best_effort"),
-                    ("allocation_mode", "automatic"),
-                    ("value_type", "integer"),
-                ],
-            ),
-            1.0
-        );
-
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(reserved, vec![assigned]);
         Ok(())
     }
 
@@ -3682,7 +5986,7 @@ mod test {
         Ok(crate::resource_pool::create_common_pools(pool.clone(), HashSet::new()).await?)
     }
 
-    async fn wait_until_blocked_on(pool: &sqlx::PgPool, relation: &str) {
+    async fn wait_until_blocked_on(pool: &sqlx::PgPool, relation: &str, expected_count: i64) {
         for _ in 0..600 {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
@@ -3694,12 +5998,12 @@ mod test {
             .fetch_one(pool)
             .await
             .unwrap();
-            if waiting > 0 {
+            if waiting >= expected_count {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        panic!("query never blocked on {relation}");
+        panic!("expected {expected_count} queries blocked on {relation}");
     }
 
     /// The machine snapshot reports the BMC IP from the *live* `machine_interface_addresses`
@@ -3924,6 +6228,65 @@ mod test {
         let stats = crate::resource_pool::stats(&pool, LOOPBACK_IP_V6).await?;
         assert_eq!(stats.used, 1);
         assert_eq!(stats.free, 0);
+        Ok(())
+    }
+
+    /// A surviving `lo-ip` pool reservation must satisfy the next allocation for
+    /// the same DPU. Otherwise a cleared `network_config.loopback_ip` field lets
+    /// one DPU consume a second IPv4 loopback, matching the IPv6 reuse contract.
+    #[crate::sqlx_test]
+    async fn ipv4_loopback_reservation_is_reused_and_leaves_one_owned_entry(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let common_pools = common_pools(&pool, None).await?;
+        let dpu_id =
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")?;
+
+        let mut txn = pool.begin().await?;
+        let allocated =
+            super::allocate_loopback_ip(&common_pools, txn.as_mut(), &dpu_id.to_string()).await?;
+        let reused =
+            super::allocate_loopback_ip(&common_pools, txn.as_mut(), &dpu_id.to_string()).await?;
+        assert_eq!(allocated, reused);
+
+        let stats = crate::resource_pool::stats(txn.as_mut(), LOOPBACK_IP).await?;
+        assert_eq!(stats.used, 1);
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    /// Two `lo-ip` rows owned by one DPU is corrupted state: allocation must
+    /// surface it as inconsistent rather than silently hand back one value and
+    /// leave the DPU still owning a second.
+    #[crate::sqlx_test]
+    async fn ipv4_loopback_rejects_multiple_reservations_for_one_dpu(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let common_pools = common_pools(&pool, None).await?;
+        let dpu_id =
+            MachineId::from_str("fm100dskla0ihp0pn4tv7v1js2k2mo37sl0jjr8141okqg8pjpdpfihaa80")?;
+        let owner_id = dpu_id.to_string();
+
+        let mut txn = pool.begin().await?;
+        // Seed two reservations for the same owner so the ownership lookup sees
+        // more than one owned value.
+        for _ in 0..2 {
+            crate::resource_pool::allocate(
+                &common_pools.ethernet.pool_loopback_ip,
+                txn.as_mut(),
+                model::resource_pool::OwnerType::Machine,
+                &owner_id,
+                None,
+            )
+            .await?;
+        }
+
+        let error = super::allocate_loopback_ip(&common_pools, txn.as_mut(), &owner_id)
+            .await
+            .expect_err("two lo-ip values owned by one DPU must be rejected as inconsistent state");
+        assert!(matches!(error, crate::DatabaseError::FailedPrecondition(_)));
+
+        txn.rollback().await?;
         Ok(())
     }
 
@@ -4191,7 +6554,7 @@ mod test {
         let backfill = tokio::spawn(async move {
             super::update_dpu_loopback_ips_v6(&backfill_pool, &backfill_common_pools).await
         });
-        wait_until_blocked_on(&pool, "resource_pool").await;
+        wait_until_blocked_on(&pool, "resource_pool", 1).await;
 
         let mut txn = pool.begin().await?;
         let (mut network_config, version) =
@@ -4199,14 +6562,15 @@ mod test {
                 .await?
                 .take();
         network_config.use_admin_network = Some(false);
-        assert!(
+        assert_eq!(
             super::try_update_network_config(
                 txn.as_mut(),
                 &dpu_machine_id,
                 version,
                 &network_config,
             )
-            .await?
+            .await?,
+            crate::ConditionalWrite::Applied(())
         );
         txn.commit().await?;
         reservation_lock.commit().await?;

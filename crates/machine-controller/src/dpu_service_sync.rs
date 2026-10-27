@@ -16,7 +16,7 @@
  */
 
 //! Releasing the DPF maintenance hold that parks a host's DPUs while a changed
-//! DPUService waits to roll out.
+//! DPUDeployment-owned DPUService revision waits to roll out.
 //!
 //! Shared by the two callers that can decide to lift a hold: the `Ready` state
 //! handler, which does it on carbide's own initiative for idle hosts, and the
@@ -26,8 +26,8 @@
 
 use carbide_dpf::sdk::{dpu_cr_name, dpu_node_cr_name};
 use carbide_uuid::instance::InstanceId;
-use carbide_uuid::machine::MachineId;
-use model::machine::Machine;
+use carbide_uuid::machine::DpuMachineId;
+use model::machine::{DpuMachine, HostMachine};
 use model::machine_pending_action::MachinePendingActionActor;
 use model::machine_pending_action::MachinePendingActionKind::DpuServiceSync;
 use sqlx::PgPool;
@@ -64,10 +64,10 @@ pub enum ReleaseOutcome {
     Released,
     /// A DPU still differs from its DPUDeployment, so its OS is about to be
     /// replaced. Retrying achieves nothing until it has been reprovisioned.
-    DeferredDpuOutdated { dpu: MachineId },
+    DeferredDpuOutdated { dpu: DpuMachineId },
     /// A DPU could not be evaluated at all. Unlike an outdated DPU this is worth
     /// retrying, since it usually means Kubernetes was unreachable.
-    DeferredUnknown { dpu: MachineId, reason: String },
+    DeferredUnknown { dpu: DpuMachineId, reason: String },
     /// The host is assigned and the policy did not permit disrupting it.
     DeferredHostAssigned { instance: InstanceId },
     /// The attempt failed part-way. Retryable.
@@ -89,8 +89,8 @@ pub enum ReleaseOutcome {
 pub async fn release_hold_if_dpus_are_current(
     dpf_sdk: &dyn DpfOperations,
     db_pool: &PgPool,
-    host: &Machine,
-    dpus: &[Machine],
+    host: &HostMachine,
+    dpus: &[DpuMachine],
     tenant_policy: TenantPolicy,
     actor: MachinePendingActionActor,
 ) -> ReleaseOutcome {

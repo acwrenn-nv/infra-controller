@@ -23,34 +23,42 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use kube::core::ObjectMeta;
 
 use crate::crds::dpfoperatorconfigs_generated::DPFOperatorConfig;
-use crate::crds::dpudeployments_generated::DPUDeployment;
-use crate::crds::dpus_generated::DPU;
+use crate::crds::dpudeployments_generated::{
+    DPUDeployment, DpuDeploymentDpusDpuSets, DpuDeploymentDpusDpuSetsDpuNodeSelector,
+};
+use crate::crds::dpus_generated::{DPU, DpuStatusPhase};
 use crate::crds::dpuservicetemplates_generated::DPUServiceTemplate;
 use crate::error::DpfError;
 use crate::repository::{
     DpfOperatorConfigRepository, DpuDeploymentRepository, DpuRepository,
     DpuServiceTemplateRepository, K8sConfigRepository,
 };
-use crate::sdk::DpfSdkBuilder;
+use crate::sdk::{DpfSdkBuilder, ResourceLabeler};
+use crate::types::{DPU_ENABLED_NODE_LABEL, DpuDeploymentType, DpuPhase};
 
 const TEST_NS: &str = "test-namespace";
 const DEPLOYMENT: &str = "test-deployment";
 const FLAVOR: &str = "test-flavor";
 const DPU_NAME: &str = "node-host-001-device-001";
 const OWNED_BY_LABEL: &str = "svc.dpu.nvidia.com/owned-by-dpudeployment";
+const BF3_LABEL: &str = "test.nvidia.com/bf3";
+const GB200_LABEL: &str = "test.nvidia.com/bf3gb200";
 
 #[derive(Default, Clone)]
 struct OutdatedDpuMock {
     dpus: Arc<DashMap<String, DPU>>,
     deployments: Arc<DashMap<String, DPUDeployment>>,
     operator_config: Arc<DashMap<String, DPFOperatorConfig>>,
+    dpu_list_selectors: Arc<Mutex<Vec<Option<String>>>>,
+    // Simulate CRs disappearing immediately after the GET or LIST observation.
+    remove_dpus_after_read: bool,
 }
 
 impl OutdatedDpuMock {
@@ -65,10 +73,21 @@ impl OutdatedDpuMock {
 #[async_trait]
 impl DpuRepository for OutdatedDpuMock {
     async fn get(&self, name: &str, _ns: &str) -> Result<Option<DPU>, DpfError> {
+        if self.remove_dpus_after_read {
+            return Ok(self.dpus.remove(name).map(|(_, dpu)| dpu));
+        }
         Ok(self.dpus.get(name).map(|dpu| dpu.clone()))
     }
-    async fn list(&self, _ns: &str, _selector: Option<&str>) -> Result<Vec<DPU>, DpfError> {
-        Ok(self.dpus.iter().map(|e| e.value().clone()).collect())
+    async fn list(&self, _ns: &str, selector: Option<&str>) -> Result<Vec<DPU>, DpfError> {
+        self.dpu_list_selectors
+            .lock()
+            .unwrap()
+            .push(selector.map(str::to_string));
+        let dpus = self.dpus.iter().map(|e| e.value().clone()).collect();
+        if self.remove_dpus_after_read {
+            self.dpus.clear();
+        }
+        Ok(dpus)
     }
     async fn patch_status(
         &self,
@@ -78,8 +97,22 @@ impl DpuRepository for OutdatedDpuMock {
     ) -> Result<(), DpfError> {
         Ok(())
     }
-    async fn delete(&self, _name: &str, _ns: &str) -> Result<(), DpfError> {
+    async fn delete(&self, name: &str, _ns: &str) -> Result<(), DpfError> {
+        self.dpus.remove(name);
         Ok(())
+    }
+    async fn delete_if_uid(&self, name: &str, ns: &str, uid: &str) -> Result<(), DpfError> {
+        let current_uid = self
+            .dpus
+            .get(name)
+            .map(|dpu| dpu.metadata.uid.clone())
+            .ok_or_else(|| DpfError::not_found("DPU", name))?;
+        if current_uid.as_deref() != Some(uid) {
+            return Err(DpfError::InvalidState(format!(
+                "DPU {name} no longer has UID {uid}"
+            )));
+        }
+        DpuRepository::delete(self, name, ns).await
     }
     fn watch<F, Fut>(
         &self,
@@ -273,6 +306,259 @@ fn template_deployment(
     deployment
 }
 
+/// Supplies the two BF3 deployment selectors used by the conformance test.
+struct DeploymentTypeLabeler;
+
+impl ResourceLabeler for DeploymentTypeLabeler {
+    fn node_labels_for_deployment_type(
+        &self,
+        deployment_type: DpuDeploymentType,
+    ) -> Result<BTreeMap<String, String>, DpfError> {
+        let deployment_label = match deployment_type {
+            DpuDeploymentType::Bf3 => BF3_LABEL,
+            DpuDeploymentType::Bf3Gb200 => GB200_LABEL,
+            other => {
+                return Err(DpfError::ConfigError(format!(
+                    "no test deployment configured for {other:?}"
+                )));
+            }
+        };
+
+        Ok(BTreeMap::from([
+            (DPU_ENABLED_NODE_LABEL.to_string(), "true".to_string()),
+            (deployment_label.to_string(), "true".to_string()),
+        ]))
+    }
+}
+
+/// Add the DPUSet selector that identifies a deployment type.
+fn deployment_with_selector(
+    bfb: Option<&str>,
+    ready: bool,
+    deployment_type: DpuDeploymentType,
+) -> DPUDeployment {
+    deployment_with_selector_for_fixture(deployment(bfb, None, ready), deployment_type)
+}
+
+/// Adds the selector for a deployment type to an otherwise complete fixture.
+fn deployment_with_selector_for_fixture(
+    mut deployment: DPUDeployment,
+    deployment_type: DpuDeploymentType,
+) -> DPUDeployment {
+    let match_labels = DeploymentTypeLabeler
+        .node_labels_for_deployment_type(deployment_type)
+        .expect("test deployment selector");
+    deployment.spec.dpus.dpu_sets = Some(vec![DpuDeploymentDpusDpuSets {
+        dpu_annotations: None,
+        dpu_selector: None,
+        name_suffix: "default".to_string(),
+        dpu_node_selector: Some(DpuDeploymentDpusDpuSetsDpuNodeSelector {
+            match_expressions: None,
+            match_labels: Some(match_labels),
+        }),
+        dpu_cluster_selector: None,
+        dpu_device_selector: None,
+        node_selector: None,
+    }]);
+    deployment
+}
+
+/// Replace the owning deployment label on a DPU fixture.
+fn set_dpu_owner(mut dpu: DPU, deployment_name: &str) -> DPU {
+    dpu.metadata.labels = Some(BTreeMap::from([(
+        OWNED_BY_LABEL.to_string(),
+        format!("{TEST_NS}_{deployment_name}"),
+    )]));
+    dpu
+}
+
+async fn phase_for_deployment_type(mock: OutdatedDpuMock) -> Result<Option<DpuPhase>, DpfError> {
+    let phases = DpfSdkBuilder::new(mock, TEST_NS, String::new())
+        .with_labeler(DeploymentTypeLabeler)
+        .build_without_resources()
+        .await
+        .expect("sdk")
+        .get_dpu_phases_for_deployment_type(
+            &["001".to_string()],
+            "node-host-001",
+            DpuDeploymentType::Bf3Gb200,
+        )
+        .await?;
+
+    Ok(phases.and_then(|mut phases| phases.remove("001")))
+}
+
+#[tokio::test]
+async fn phase_observations_wait_for_missing_phase() {
+    let mut dpu = dpu(Some("bf-bundle-abc"), None, None, FLAVOR);
+    dpu.status = Some(serde_json::from_value(serde_json::json!({})).unwrap());
+    let mock = OutdatedDpuMock::with(
+        dpu,
+        deployment_with_selector_for_fixture(
+            deployment(Some("bf-bundle-abc"), None, true),
+            DpuDeploymentType::Bf3Gb200,
+        ),
+    );
+    let sdk = DpfSdkBuilder::new(mock, TEST_NS, String::new())
+        .with_labeler(DeploymentTypeLabeler)
+        .build_without_resources()
+        .await
+        .unwrap();
+    assert!(matches!(
+        sdk.get_dpu_phase_observation("001", "node-host-001").await,
+        Err(DpfError::InvalidState(message)) if message.contains("no status phase")
+    ));
+    assert!(
+        sdk.get_dpu_phase_observations_for_deployment_type(
+            &["001".to_string()],
+            "node-host-001",
+            DpuDeploymentType::Bf3Gb200,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+}
+
+/// Both readers retain diagnostics from the observed `Error` CR, even if it
+/// disappears immediately. Other phases must not acquire failure details.
+#[tokio::test]
+async fn failure_diagnostics_come_from_the_phase_observation() {
+    struct Case {
+        name: &'static str,
+        scoped_to_deployment: bool,
+        bfb: Option<&'static str>,
+        blue_field_software: Option<&'static str>,
+        phase: &'static str,
+        expected_phase: DpuPhase,
+        expected_failure: bool,
+    }
+
+    let condition = serde_json::json!({
+        "type": "FirmwareReady",
+        "status": "False",
+        "reason": "TaskNotFound",
+        "message": "Redfish task 42 disappeared",
+        "lastTransitionTime": "2026-09-30T01:02:03Z",
+        "observedGeneration": 7,
+    });
+    let mut status = serde_json::json!({
+        "phase": "Error",
+        "previousPhase": "Update Firmware",
+        "redfishTaskId": "42",
+        "dpfVersion": "v26.8.0",
+        "conditions": [condition],
+        "operationalConditions": [{
+            "type": "NVConfigUpToDate",
+            "status": "Unknown",
+            "reason": "Pending",
+            "message": "waiting on firmware",
+            "lastTransitionTime": "2026-09-30T01:02:04Z",
+        }],
+        "agentStatus": {
+            "conditions": [condition],
+            "preInstall": {
+                "conditions": [condition],
+            },
+        },
+    });
+    status["agentStatus"]["conditions"][0]["message"] =
+        serde_json::json!("Agent has not completed firmware preparation");
+    status["agentStatus"]["preInstall"]["conditions"][0]["message"] =
+        serde_json::json!("Pre-install firmware check is pending");
+    let cases = [
+        Case {
+            name: "direct GET preserves the BFB source",
+            scoped_to_deployment: false,
+            bfb: Some("bf-bundle-abc"),
+            blue_field_software: None,
+            phase: "Error",
+            expected_phase: DpuPhase::Error,
+            expected_failure: true,
+        },
+        Case {
+            name: "deployment-scoped GET preserves the BlueFieldSoftware source",
+            scoped_to_deployment: true,
+            bfb: None,
+            blue_field_software: Some("bf-software-123"),
+            phase: "Error",
+            expected_phase: DpuPhase::Error,
+            expected_failure: true,
+        },
+        Case {
+            name: "an installing DPU has no terminal failure details",
+            scoped_to_deployment: false,
+            bfb: Some("bf-bundle-abc"),
+            blue_field_software: None,
+            phase: "OS Installing",
+            expected_phase: DpuPhase::Provisioning("OsInstalling".to_string()),
+            expected_failure: false,
+        },
+    ];
+
+    for case in cases {
+        let mut status = status.clone();
+        status["phase"] = serde_json::json!(case.phase);
+        let mut dpu = dpu(case.bfb, case.blue_field_software, None, FLAVOR);
+        dpu.metadata.uid = Some("failed-dpu-uid".to_string());
+        dpu.metadata.resource_version = Some("123".to_string());
+        dpu.metadata.generation = Some(7);
+        dpu.status =
+            Some(serde_json::from_value(status.clone()).expect("valid failure status fixture"));
+        let mut mock = OutdatedDpuMock::with(
+            dpu,
+            deployment_with_selector_for_fixture(
+                deployment(case.bfb, case.blue_field_software, true),
+                DpuDeploymentType::Bf3Gb200,
+            ),
+        );
+        mock.remove_dpus_after_read = true;
+        let sdk = DpfSdkBuilder::new(mock.clone(), TEST_NS, String::new())
+            .with_labeler(DeploymentTypeLabeler)
+            .build_without_resources()
+            .await
+            .expect("build the SDK for the failure observation");
+        let observation = if case.scoped_to_deployment {
+            sdk.get_dpu_phase_observations_for_deployment_type(
+                &["001".to_string()],
+                "node-host-001",
+                DpuDeploymentType::Bf3Gb200,
+            )
+            .await
+            .expect("deployment-scoped GET should succeed")
+            .expect("deployment-scoped GET should observe every requested DPU")
+            .remove("001")
+            .expect("deployment-scoped GET should include DPU 001")
+        } else {
+            sdk.get_dpu_phase_observation("001", "node-host-001")
+                .await
+                .expect("direct GET should return a phase observation")
+        };
+        assert!(mock.dpus.is_empty(), "{}: the CR should be gone", case.name);
+        assert_eq!(observation.phase, case.expected_phase, "{}", case.name);
+        let failure = observation.failure.map(|failure| {
+            serde_json::to_value(failure).expect("serialize the failure observation")
+        });
+        let expected_failure = case.expected_failure.then(|| {
+            serde_json::json!({
+                "name": DPU_NAME,
+                "namespace": TEST_NS,
+                "uid": "failed-dpu-uid",
+                "resourceVersion": "123",
+                "generation": 7,
+                "deployment": format!("{TEST_NS}_{DEPLOYMENT}"),
+                "dpuNodeName": "node-host-001",
+                "dpuDeviceName": "device-001",
+                "dpuFlavor": FLAVOR,
+                "bfb": case.bfb,
+                "blueFieldSoftware": case.blue_field_software,
+                "status": status,
+            })
+        });
+        assert_eq!(failure, expected_failure, "{}", case.name);
+    }
+}
+
 async fn is_outdated(mock: OutdatedDpuMock) -> Result<bool, DpfError> {
     DpfSdkBuilder::new(mock, TEST_NS, String::new())
         .build_without_resources()
@@ -280,6 +566,280 @@ async fn is_outdated(mock: OutdatedDpuMock) -> Result<bool, DpfError> {
         .expect("sdk")
         .is_dpu_outdated(DPU_NAME)
         .await
+}
+
+/// A phase read scoped to one deployment accepts work still running on the target,
+/// while Ready also requires the target flavor and provisioning source.
+#[tokio::test]
+async fn a_dpu_phase_must_belong_to_the_requested_deployment_type() {
+    struct Case {
+        name: &'static str,
+        owner: &'static str,
+        flavor: &'static str,
+        phase: DpuStatusPhase,
+        installed_bfb_file: Option<&'static str>,
+        deployment_ready: bool,
+        expected: Option<DpuPhase>,
+    }
+
+    let cases = [
+        Case {
+            name: "source deployment still owns the DPU",
+            owner: "source-deployment",
+            flavor: FLAVOR,
+            phase: DpuStatusPhase::Ready,
+            installed_bfb_file: Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            deployment_ready: true,
+            expected: None,
+        },
+        Case {
+            name: "target deployment owns a DPU still installing",
+            owner: DEPLOYMENT,
+            flavor: FLAVOR,
+            phase: DpuStatusPhase::OsInstalling,
+            installed_bfb_file: None,
+            deployment_ready: true,
+            expected: Some(DpuPhase::Provisioning("OsInstalling".to_string())),
+        },
+        Case {
+            name: "target deployment has not reconciled its DPU sets",
+            owner: DEPLOYMENT,
+            flavor: FLAVOR,
+            phase: DpuStatusPhase::Ready,
+            installed_bfb_file: Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            deployment_ready: false,
+            expected: None,
+        },
+        Case {
+            name: "target deployment owns a matching DPU",
+            owner: DEPLOYMENT,
+            flavor: FLAVOR,
+            phase: DpuStatusPhase::Ready,
+            installed_bfb_file: Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            deployment_ready: true,
+            expected: Some(DpuPhase::Ready),
+        },
+    ];
+
+    for case in cases {
+        let mut dpu = set_dpu_owner(
+            dpu(
+                Some("bf-bundle-abc"),
+                None,
+                case.installed_bfb_file,
+                case.flavor,
+            ),
+            case.owner,
+        );
+        dpu.status.as_mut().expect("DPU status").phase = Some(case.phase);
+        let deployment = deployment_with_selector(
+            Some("bf-bundle-abc"),
+            case.deployment_ready,
+            DpuDeploymentType::Bf3Gb200,
+        );
+
+        assert_eq!(
+            phase_for_deployment_type(OutdatedDpuMock::with(dpu, deployment))
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name)),
+            case.expected,
+            "{}",
+            case.name
+        );
+    }
+}
+
+/// A Ready DPU owned by the target cannot converge without another deletion,
+/// so configuration drift must be reported instead of treated as recreation.
+#[tokio::test]
+async fn a_ready_target_dpu_with_configuration_drift_is_an_error() {
+    let dpu = dpu(
+        Some("bf-bundle-abc"),
+        None,
+        Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+        "source-flavor",
+    );
+    let deployment =
+        deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3Gb200);
+
+    let error = phase_for_deployment_type(OutdatedDpuMock::with(dpu, deployment))
+        .await
+        .expect_err("Ready configuration drift must be visible");
+    assert!(matches!(error, DpfError::InvalidState(_)));
+}
+
+/// A rendered DPUFlavorTemplate cannot be compared with the flavor name on a
+/// DPU CR, so migration conformance reports a visible configuration error.
+#[tokio::test]
+async fn a_deployment_type_phase_rejects_a_flavor_template() {
+    let dpu = dpu(
+        Some("bf-bundle-abc"),
+        None,
+        Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+        FLAVOR,
+    );
+    let mut deployment = template_deployment(Some("bf-bundle-abc"), None, true);
+    deployment = deployment_with_selector_for_fixture(deployment, DpuDeploymentType::Bf3Gb200);
+
+    let error = phase_for_deployment_type(OutdatedDpuMock::with(dpu, deployment))
+        .await
+        .expect_err("DPUFlavorTemplate must not produce a confident phase");
+    assert!(matches!(error, DpfError::InvalidState(_)));
+}
+
+/// A deployment scoped phase read requires one unambiguous deployment owner.
+#[tokio::test]
+async fn a_deployment_type_phase_requires_exactly_one_deployment() {
+    for (name, deployment_count, expected_message) in [
+        ("no matching deployment", 0, "no DPUDeployment selects"),
+        (
+            "multiple matching deployments",
+            2,
+            "multiple DPUDeployments select",
+        ),
+    ] {
+        let mock = OutdatedDpuMock::default();
+        for index in 0..deployment_count {
+            let mut deployment =
+                deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3Gb200);
+            let deployment_name = format!("target-deployment-{index}");
+            deployment.metadata.name = Some(deployment_name.clone());
+            mock.deployments.insert(deployment_name, deployment);
+        }
+
+        let error = phase_for_deployment_type(mock).await.expect_err(name);
+        assert!(
+            matches!(&error, DpfError::InvalidState(message) if message.contains(expected_message)),
+            "{name}: {error}"
+        );
+    }
+}
+
+/// A deployment phase read fetches each requested DPU by name. Listing the
+/// collection would grow with the site's DPU count on every handler run.
+#[tokio::test]
+async fn a_deployment_type_phase_reads_requested_dpus_by_name() {
+    let dpu = set_dpu_owner(
+        dpu(
+            Some("bf-bundle-abc"),
+            None,
+            Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            FLAVOR,
+        ),
+        DEPLOYMENT,
+    );
+    let deployment =
+        deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3Gb200);
+    let mock = OutdatedDpuMock::with(dpu, deployment);
+
+    let phase = phase_for_deployment_type(mock.clone())
+        .await
+        .expect("deployment phase");
+
+    assert_eq!(phase, Some(DpuPhase::Ready));
+    assert!(mock.dpu_list_selectors.lock().unwrap().is_empty());
+}
+
+/// Duplicate device IDs cannot produce a complete deployment observation set.
+#[tokio::test]
+async fn deployment_phase_observations_reject_duplicate_device_ids() {
+    let dpu = dpu(
+        Some("bf-bundle-abc"),
+        None,
+        Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+        FLAVOR,
+    );
+    let deployment =
+        deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3Gb200);
+    let mock = OutdatedDpuMock::with(dpu, deployment);
+    let sdk = DpfSdkBuilder::new(mock.clone(), TEST_NS, String::new())
+        .with_labeler(DeploymentTypeLabeler)
+        .build_without_resources()
+        .await
+        .expect("sdk");
+
+    let observations = sdk
+        .get_dpu_phase_observations_for_deployment_type(
+            &["001".to_string(), "001".to_string()],
+            "node-host-001",
+            DpuDeploymentType::Bf3Gb200,
+        )
+        .await
+        .expect("deployment observations");
+
+    assert!(observations.is_none());
+    assert!(mock.dpu_list_selectors.lock().unwrap().is_empty());
+}
+
+/// Retrying a deployment migration removes a DPU owned by the source but
+/// preserves a replacement with the same name once the target owns it.
+#[tokio::test]
+async fn deployment_migration_deletion_preserves_target_replacements() {
+    let mock = OutdatedDpuMock::default();
+    let mut source_deployment =
+        deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3);
+    source_deployment.metadata.name = Some("source-deployment".to_string());
+    let target_deployment =
+        deployment_with_selector(Some("bf-bundle-abc"), true, DpuDeploymentType::Bf3Gb200);
+    mock.deployments
+        .insert("source-deployment".to_string(), source_deployment);
+    mock.deployments
+        .insert(DEPLOYMENT.to_string(), target_deployment);
+
+    let mut source_dpu = set_dpu_owner(
+        dpu(
+            Some("bf-bundle-abc"),
+            None,
+            Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            FLAVOR,
+        ),
+        "source-deployment",
+    );
+    source_dpu.metadata.uid = Some("source-uid".to_string());
+    mock.dpus.insert(DPU_NAME.to_string(), source_dpu);
+
+    let sdk = DpfSdkBuilder::new(mock.clone(), TEST_NS, String::new())
+        .with_labeler(DeploymentTypeLabeler)
+        .build_without_resources()
+        .await
+        .expect("sdk");
+    sdk.delete_source_dpus_for_deployment_migration(
+        &["001".to_string()],
+        "node-host-001",
+        DpuDeploymentType::Bf3,
+        DpuDeploymentType::Bf3Gb200,
+    )
+    .await
+    .expect("source DPU deletion");
+    assert!(mock.dpus.get(DPU_NAME).is_none());
+
+    let mut target_dpu = set_dpu_owner(
+        dpu(
+            Some("bf-bundle-abc"),
+            None,
+            Some("/bfb/test-namespace-bf-bundle-abc.bfb"),
+            FLAVOR,
+        ),
+        DEPLOYMENT,
+    );
+    target_dpu.metadata.uid = Some("target-uid".to_string());
+    mock.dpus.insert(DPU_NAME.to_string(), target_dpu);
+
+    sdk.delete_source_dpus_for_deployment_migration(
+        &["001".to_string()],
+        "node-host-001",
+        DpuDeploymentType::Bf3,
+        DpuDeploymentType::Bf3Gb200,
+    )
+    .await
+    .expect("migration retry");
+
+    let replacement = mock
+        .dpus
+        .get(DPU_NAME)
+        .expect("target replacement must be preserved");
+    assert_eq!(replacement.metadata.uid.as_deref(), Some("target-uid"));
+    assert!(mock.dpu_list_selectors.lock().unwrap().is_empty());
 }
 
 /// Both provisioning sources, matching and drifted. A DPUDeployment declares

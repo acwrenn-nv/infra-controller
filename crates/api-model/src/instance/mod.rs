@@ -16,13 +16,14 @@
  */
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{HostMachineId, MachineId};
 use config_version::ConfigVersion;
 
 use crate::instance::config::InstanceConfig;
 use crate::metadata::{LabelFilter, Metadata};
 
 pub mod config;
+pub mod nic_firmware;
 pub mod snapshot;
 pub mod status;
 
@@ -43,7 +44,7 @@ pub enum InstanceNetworkSyncStatus {
 
 pub struct NewInstance<'a> {
     pub instance_id: InstanceId,
-    pub machine_id: MachineId,
+    pub machine_id: HostMachineId,
     pub instance_type_id: Option<InstanceTypeId>,
     pub config: &'a InstanceConfig,
     pub metadata: Metadata,

@@ -46,6 +46,8 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true, features = ["tls-rustls"] }
 bmc-mock = { path = "../bmc-mock" }
@@ -53,6 +55,7 @@ carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
 nv-redfish = { workspace = true, features = ["chassis"] }
 rustls = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

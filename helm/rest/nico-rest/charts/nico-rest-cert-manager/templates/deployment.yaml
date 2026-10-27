@@ -17,6 +17,10 @@ spec:
     metadata:
       labels:
         {{- include "nico-rest-cert-manager.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       imagePullSecrets:
         {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
@@ -47,6 +51,9 @@ spec:
             - --tls-port={{ .Values.config.tlsPort }}
             - --insecure-port={{ .Values.config.insecurePort }}
             - --ca-base-dns={{ .Values.config.caBaseDns }}
+            {{- range include "nico-rest-cert-manager.dnsNames" . | fromYamlArray }}
+            - --dns-name={{ . }}
+            {{- end }}
             {{- if .Values.config.debug }}
             - --debug
             {{- end }}
@@ -55,6 +62,13 @@ spec:
               name: https
             - containerPort: {{ .Values.config.insecurePort }}
               name: http
+          {{- with .Values.extraEnv }}
+          env:
+            {{- range $k, $v := . }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
           volumeMounts:
             - name: ca-signing-secret
               mountPath: /etc/pki/ca

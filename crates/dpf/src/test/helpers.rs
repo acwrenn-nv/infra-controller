@@ -160,6 +160,9 @@ impl DpuRepository for WatcherMock {
     async fn delete(&self, _: &str, _: &str) -> Result<(), DpfError> {
         Ok(())
     }
+    async fn delete_if_uid(&self, name: &str, _ns: &str, _uid: &str) -> Result<(), DpfError> {
+        Err(DpfError::not_found("DPU", name))
+    }
     fn watch<F, Fut>(
         &self,
         _: &str,
@@ -204,7 +207,9 @@ pub(super) fn make_status(phase: DpuStatusPhase) -> DpuStatus {
         firmware: None,
         observed_generation: None,
         pci_device: None,
-        phase,
+        phase: Some(phase),
+        dpu_reconfig: None,
+        post_provisioning_dpu_config: None,
         post_provisioning_node_effect: None,
         required_reset: None,
         agent_last_startup_time: None,

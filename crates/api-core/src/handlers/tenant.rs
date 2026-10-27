@@ -14,9 +14,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use ::rpc::errors::RpcDataConversionError;
 use ::rpc::forge as rpc;
+use carbide_network::virtualization::VpcVirtualizationType;
 use model::ConfigValidationError;
 use model::metadata::Metadata;
+use model::nic_firmware::NicFirmwareProfileId;
+use model::tenant::TenantOrganizationId;
 use tonic::{Request, Response, Status};
 
 use crate::CarbideError;
@@ -133,8 +137,46 @@ pub(crate) async fn find(
         .map(Response::new)?
         .into_inner()
     {
-        None => rpc::FindTenantResponse { tenant: None },
-        Some(t) => t.try_into().map_err(CarbideError::from)?,
+        None => rpc::FindTenantResponse {
+            tenant: None,
+            permitted_routing_profile_types: vec![],
+        },
+        Some(t) => {
+            let permitted_routing_profile_types = match (
+                t.routing_profile_type.as_deref(),
+                api.runtime_config.fnn.as_ref(),
+            ) {
+                (Some(tenant_profile_type), Some(fnn)) => {
+                    match fnn.routing_profiles.get(tenant_profile_type) {
+                        Some(tenant_profile) => {
+                            let tenant_access_tier = tenant_profile.access_tier.unwrap_or_default();
+                            let mut permitted = fnn
+                                .routing_profiles
+                                .iter()
+                                .filter(|(_, profile)| {
+                                    profile.access_tier.unwrap_or_default() >= tenant_access_tier
+                                })
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>();
+                            permitted.sort();
+                            permitted
+                        }
+                        None => {
+                            tracing::warn!(
+                                organization_id = %t.organization_id,
+                                %tenant_profile_type,
+                                "tenant routing profile is not present in the current FNN config"
+                            );
+                            vec![]
+                        }
+                    }
+                }
+                _ => vec![],
+            };
+            let mut response: rpc::FindTenantResponse = t.try_into().map_err(CarbideError::from)?;
+            response.permitted_routing_profile_types = permitted_routing_profile_types;
+            response
+        }
     };
 
     txn.commit().await?;
@@ -172,6 +214,14 @@ pub(crate) async fn update(
         .into());
     };
 
+    // FNN tenant policy must always have a named profile from which VPC policy can inherit.
+    if api.runtime_config.fnn.is_some() && routing_profile_type.is_none() {
+        return Err(CarbideError::InvalidArgument(
+            "`routing_profile_type` is required when FNN is enabled".to_string(),
+        )
+        .into());
+    }
+
     // We won't use it if FNN isn't enabled, but we can still map so a caller integrating
     // with us before FNN is enabled on a site will be told if they're sending invalid values.
     if let Some(profile) = routing_profile_type.as_ref() {
@@ -192,18 +242,14 @@ pub(crate) async fn update(
         }
     };
 
-    // If a tenant routing profile is being updated,
-    // it can only be allowed if there are no existing VPCs
-    // for the tenant.  Technically, at the moment, it's probably
-    // ok to allow it as long it's not switching between profiles
-    // that have a differing `internal` value (e.g., switching from
-    // internal==true to false), but total restriction is safer
-    // and easy to loosen later if we find we need it.
+    // Tenant routing profiles affect only FNN VPC policy, so non-FNN VPCs do not block
+    // an update needed to prepare a historical profileless tenant for FNN.
     if current_tenant.routing_profile_type != routing_profile_type
         && !db::vpc::find_ids(
             &mut txn,
             model::vpc::VpcSearchFilter {
                 tenant_org_id: Some(organization_id.clone()),
+                network_virtualization_type: Some(VpcVirtualizationType::Fnn),
                 ..Default::default()
             },
         )
@@ -211,7 +257,7 @@ pub(crate) async fn update(
         .is_empty()
     {
         return Err(CarbideError::FailedPrecondition(
-            "cannot update tenant routing profile type for tenant with active VPCs".to_string(),
+            "cannot update tenant routing profile type for tenant with active FNN VPCs".to_string(),
         )
         .into());
     }
@@ -237,6 +283,85 @@ pub(crate) async fn update(
     txn.commit().await?;
 
     Ok(response)
+}
+
+/// Reads the operator's selection and shared version even when no profile is selected.
+pub(crate) async fn get_nic_firmware_config(
+    api: &Api,
+    request: Request<rpc::GetTenantNicFirmwareConfigRequest>,
+) -> Result<Response<rpc::GetTenantNicFirmwareConfigResponse>, Status> {
+    // The shared logger truncates by byte offset before validation. Escaping
+    // produces ASCII so truncation cannot split a multi-byte character.
+    crate::api::log_request_data_redacted(
+        format!("{:?}", request.get_ref())
+            .escape_default()
+            .to_string(),
+    );
+    let request = request.into_inner();
+    let organization_id = request
+        .tenant_organization_id
+        .parse::<TenantOrganizationId>()
+        .map_err(|error| CarbideError::InvalidArgument(error.to_string()))?;
+    log_tenant_organization_id(organization_id.as_str());
+
+    let config = db::tenant::find_nic_firmware_config(api.pg_pool(), &organization_id)
+        .await
+        .map_err(CarbideError::from)?
+        .ok_or_else(|| CarbideError::NotFoundError {
+            kind: "tenant",
+            id: organization_id.to_string(),
+        })?;
+    Ok(Response::new(rpc::GetTenantNicFirmwareConfigResponse {
+        firmware_config: Some(config.into()),
+    }))
+}
+
+/// Changes the operator's selection and shared tenant version in one transaction.
+pub(crate) async fn set_nic_firmware_config(
+    api: &Api,
+    request: Request<rpc::SetTenantNicFirmwareConfigRequest>,
+) -> Result<Response<rpc::SetTenantNicFirmwareConfigResponse>, Status> {
+    // The shared logger truncates by byte offset before validation. Escaping
+    // produces ASCII so truncation cannot split a multi-byte character.
+    crate::api::log_request_data_redacted(
+        format!("{:?}", request.get_ref())
+            .escape_default()
+            .to_string(),
+    );
+    let request = request.into_inner();
+    let organization_id = request
+        .tenant_organization_id
+        .parse::<TenantOrganizationId>()
+        .map_err(|error| CarbideError::InvalidArgument(error.to_string()))?;
+    log_tenant_organization_id(organization_id.as_str());
+    let expected_version = request
+        .if_version_match
+        .parse()
+        .map_err(|_| RpcDataConversionError::InvalidConfigVersion(request.if_version_match))
+        .map_err(CarbideError::from)?;
+    let profile_id: Option<NicFirmwareProfileId> = match request
+        .action
+        .ok_or(CarbideError::MissingArgument("action"))?
+    {
+        rpc::set_tenant_nic_firmware_config_request::Action::ProfileId(id) => {
+            Some(id.parse().map_err(CarbideError::from)?)
+        }
+        rpc::set_tenant_nic_firmware_config_request::Action::Clear(()) => None,
+    };
+
+    let mut txn = api.txn_begin().await?;
+    let config = db::tenant::set_nic_firmware_config(
+        &mut txn,
+        &organization_id,
+        profile_id.as_ref(),
+        expected_version,
+    )
+    .await
+    .map_err(CarbideError::from)?;
+    txn.commit().await?;
+    Ok(Response::new(rpc::SetTenantNicFirmwareConfigResponse {
+        firmware_config: Some(config.into()),
+    }))
 }
 
 pub(crate) async fn find_tenants_by_organization_ids(

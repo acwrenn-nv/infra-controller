@@ -21,7 +21,9 @@ use carbide_proto_compiler::{CompilerConfig, TonicBuilderCodegenExt, compile};
 use tonic_client_wrapper::codegen;
 
 const PROTO_FILES: &[&str] = &[
+    "proto/codegen/v1/machine_id_types.proto",
     "proto/common.proto",
+    "proto/console_log.proto",
     "proto/scout_firmware_upgrade.proto",
     "proto/forge.proto",
     "proto/machine_discovery.proto",
@@ -36,6 +38,7 @@ const INCLUDE_PATHS: &[&str] = &["proto"];
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=../agent/proto");
+    println!("cargo:rerun-if-changed=../libmlx/proto");
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     // Write generated code to OUT_DIR rather than back into the source tree.
@@ -58,6 +61,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["../agent/proto/agent_local.proto"], &["../agent/proto"])?;
 
+    // The per-card supervisor is another local service outside Core reflection.
+    // Reuse the shared messages generated below instead of emitting duplicates.
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .extern_path(".mlx_device", "crate::protos::mlx_device")
+        .extern_path(".common", "crate::protos::common")
+        .compile_protos(
+            &["../libmlx/proto/firmware_supervisor.proto"],
+            &["../libmlx/proto", "proto"],
+        )?;
+
     // Run protoc once as the schema frontend. The resulting Schema fans out to
     // every code-generation backend and to runtime reflection.
     let schema = compile(&CompilerConfig {
@@ -71,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&reflection, &schema.raw_descriptor_set)?;
 
     let codegen = schema.collect_codegen()?;
+    let rust_descriptor_set = codegen.rust_file_descriptor_set(&schema.file_descriptor_set)?;
 
     let derive_prost_builder =
         "#[cfg_attr(feature = \"test-support\", derive(carbide_prost_builder::Builder))]";
@@ -113,6 +129,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .type_attribute(".dns", "#[derive(serde::Serialize)]")
         .type_attribute("forge.DhcpDiscovery", derive_prost_builder)
+        .field_attribute(
+            "ExpectedHostNic.mac_address",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "ExpectedHostNic.physical_ifname",
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+        )
+        .field_attribute(
+            "ExpectedHostNic.logical_ifname",
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+        )
         .field_attribute(
             "ExpectedHostNic.role",
             "#[serde(default, skip_serializing_if = \"Option::is_none\", deserialize_with = \"ExpectedInterfaceRole::deserialize_optional\", serialize_with = \"ExpectedInterfaceRole::serialize_optional\")]",
@@ -160,6 +188,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute("SkuComponentStorage.pci_patterns", "#[serde(default)]")
         .field_attribute("machine_discovery.BlockDevice.device_type", "#[serde(default)]")
         .field_attribute("machine_discovery.NvmeDevice.serial", "#[serde(default)]")
+        .field_attribute(
+            "machine_discovery.LldpSwitchData.id",
+            "#[serde(default, skip_serializing_if = \"String::is_empty\")]",
+        )
+        .field_attribute(
+            "machine_discovery.LldpSwitchData.remote_port",
+            "#[serde(default, skip_serializing_if = \"String::is_empty\")]",
+        )
         .field_attribute(
             "forge.InstanceTypeMachineCapabilityFilterAttributes.capability_type",
             "#[serde(deserialize_with = \"MachineCapabilityType::from_string\", serialize_with = \"MachineCapabilityType::serialize_from_enum_i32\")]",
@@ -226,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         extern_paths: codegen.extern_paths(),
     };
     let client_wrapper_generator =
-        codegen::CodeGenerator::new(client_wrapper_config, &schema.file_descriptor_set)?;
+        codegen::CodeGenerator::new(client_wrapper_config, &rust_descriptor_set)?;
 
     client_wrapper_generator.write_rpc_client_wrapper(out_dir.join("forge_api_client.rs"))?;
     client_wrapper_generator
@@ -241,14 +277,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         generated_types_path_within_crate: "protos".to_string(),
     };
     let nmx_c_client_wrapper =
-        codegen::CodeGenerator::new(nmx_c_client_wrapper_config, &schema.file_descriptor_set)?;
+        codegen::CodeGenerator::new(nmx_c_client_wrapper_config, &rust_descriptor_set)?;
     nmx_c_client_wrapper.write_rpc_client_wrapper(out_dir.join("nmx_c_client.rs"))?;
     nmx_c_client_wrapper.write_rpc_convenience_converters(out_dir.join("nmx_c_converters.rs"))?;
 
     // Both wrapper generators are done borrowing the descriptor set. Transfer
     // ownership to tonic/prost last; compile_fds renders Rust without invoking
     // protoc again.
-    prost_builder.compile_fds(schema.file_descriptor_set)?;
+    prost_builder.compile_fds(rust_descriptor_set)?;
 
     Ok(())
 }

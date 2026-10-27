@@ -18,8 +18,9 @@
 //! Releases the DPF maintenance hold for hosts whose DPUs are already running
 //! the software their DPUDeployment declares.
 //!
-//! A DPUService change (helm chart or image version) drives every affected DPU
-//! into the NodeEffect phase, where DPF waits for permission to disrupt it.
+//! A DPUDeployment-owned DPUService revision whose upgrade policy enables NodeEffect drives every
+//! affected DPU into that phase, where DPF waits for permission to disrupt it. Revisions configured
+//! with `applyNodeEffect=false` bypass this path.
 //! Granting that permission is only correct for a DPU that is otherwise up to
 //! date: one still awaiting reprovisioning is about to have its OS replaced, and
 //! the new services may not run on the OS currently installed.
@@ -42,7 +43,7 @@
 //! cannot be repaired by the automatic path. Recovering those is an explicit
 //! operator action rather than something this handler infers.
 
-use model::machine::{Machine, ManagedHostState, ManagedHostStateSnapshot};
+use model::machine::{HostMachine, ManagedHostState, ManagedHostStateSnapshot};
 use model::machine_pending_action::MachinePendingActionActor;
 use model::machine_pending_action::MachinePendingActionKind::DpuServiceSync;
 use state_controller::state_handler::{
@@ -145,7 +146,7 @@ pub(super) async fn handle_pending_dpu_actions(
 
 async fn pending_sync_is_outstanding(
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
-    host: &Machine,
+    host: &HostMachine,
 ) -> Result<bool, StateHandlerError> {
     let mut conn = ctx.services.db_pool.acquire().await?;
     Ok(db::machine_pending_action::is_outstanding(&mut *conn, &host.id, DpuServiceSync).await?)
@@ -158,7 +159,7 @@ async fn pending_sync_is_outstanding(
 /// causes apart when it writes the marker.
 pub(super) async fn complete_pending_sync(
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
-    host: &Machine,
+    host: &HostMachine,
 ) -> Result<bool, StateHandlerError> {
     let mut conn = ctx.services.db_pool.acquire().await?;
     // Both callers are carbide acting on its own: this handler having confirmed

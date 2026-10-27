@@ -35,17 +35,21 @@ use crate::machine::infiniband::MachineInfinibandStatusObservation;
 use crate::machine::network::{MachineNetworkStatusObservation, ManagedHostNetworkConfig};
 use crate::machine::nvlink::MachineNvLinkStatusObservation;
 use crate::machine::spx::MachineSpxStatusObservation;
+use crate::machine::spx_multiplane::MachineSpxMultiplaneStatus;
+use crate::machine::status::MlxDeviceObservation;
 use crate::machine::topology::MachineTopology;
 use crate::machine::{
-    Dpf, FailureDetails, HostProfile, HostReprovisionRequest, Machine, MachineConfig,
-    MachineInterfaceSnapshot, MachineLastRebootRequested, MachineMaintenanceRequest, MachineStatus,
-    ManagedHostState, ReprovisionRequest, UpgradeDecision,
+    AnyMachine, Dpf, DpuMachine, FailureDetails, HostMachine, HostProfile, HostReprovisionRequest,
+    MachineConfig, MachineInterfaceSnapshot, MachineLastRebootRequested, MachineMaintenanceRequest,
+    MachineSpxMultiplane, MachineStatus, ManagedHostState, PredictedHostMachine,
+    ReprovisionRequest, ResetRequest, StableHostMachine, UpgradeDecision,
 };
 use crate::machine_boot_interface::{
     BootInterfaceSelection, BootInterfaceSelectionSource, BootInterfaceStatusObservation,
     MachineBootInterfaceTarget, canonical_redfish_boot_interface_id,
 };
 use crate::metadata::Metadata;
+use crate::nic_firmware::{NicFirmwareCardSelection, NicFirmwareProfileId};
 use crate::power_manager::PowerOptions;
 use crate::rack::RackFirmwareUpgradeStatus;
 use crate::sku::SkuStatus;
@@ -70,6 +74,10 @@ pub struct MachineSnapshotPgJson {
     pub nvlink_status_observation: Option<MachineNvLinkStatusObservation>,
     pub spx_status_observation: Option<MachineSpxStatusObservation>,
     #[serde(default)]
+    pub spx_multiplane_status: Option<MachineSpxMultiplaneStatus>,
+    /// Latest complete MLX collection stored on the machine, if one exists.
+    pub mlx_device_observation: Option<MlxDeviceObservation>,
+    #[serde(default)]
     pub extension_service_status_observations: InstanceExtensionServiceStatusObservationByType,
     pub controller_state_version: String,
     pub controller_state: ManagedHostState,
@@ -82,13 +90,19 @@ pub struct MachineSnapshotPgJson {
     pub failure_details: FailureDetails,
     pub reprovisioning_requested: Option<ReprovisionRequest>,
     pub host_reprovisioning_requested: Option<HostReprovisionRequest>,
+    pub reset_requested: Option<ResetRequest>,
     pub machine_maintenance_requested: Option<MachineMaintenanceRequest>,
+    #[serde(default)]
+    pub spx_multiplane: Option<MachineSpxMultiplane>,
     #[serde(default)]
     pub decommission_requested: bool,
     #[serde(default)]
     pub bmc_credential_rotation_requested: bool,
     #[serde(default)]
     pub uefi_credential_rotation_requested: bool,
+    /// is there a forced NIC lockdown rotation requested for this host
+    #[serde(default)]
+    pub lockdown_ikm_credential_rotation_requested: bool,
     pub manual_firmware_upgrade_completed: Option<DateTime<Utc>>,
     pub bios_password_set_time: Option<DateTime<Utc>>,
     pub last_machine_validation_time: Option<DateTime<Utc>>,
@@ -96,6 +110,12 @@ pub struct MachineSnapshotPgJson {
     pub cleanup_machine_validation_id: Option<MachineValidationId>,
     pub dpu_agent_upgrade_requested: Option<UpgradeDecision>,
     pub firmware_autoupdate: Option<bool>,
+    /// Optional machine-wide NIC firmware profile reference.
+    pub nic_firmware_profile_id: Option<NicFirmwareProfileId>,
+    /// Card selections; DPU snapshot projections and older fixtures omit this
+    /// field. An omitted field decodes as an empty list.
+    #[serde(default)]
+    pub nic_firmware_card_selections: Vec<NicFirmwareCardSelection>,
     pub health_reports: Option<HealthReportSources>,
     pub on_demand_machine_validation_id: Option<MachineValidationId>,
     pub on_demand_machine_validation_request: Option<bool>,
@@ -131,8 +151,6 @@ pub struct MachineSnapshotPgJson {
     pub power_options: Option<PowerOptions>,
     pub hw_sku_device_type: Option<String>,
     pub update_complete: bool,
-    #[serde(default)]
-    pub backend_firmware_object_job_id: Option<String>,
     pub nvlink_info: Option<MachineNvLinkInfo>,
     pub dpf: Dpf,
     #[serde(default)]
@@ -250,10 +268,9 @@ fn decode_boot_interface_status_observation(
     }
 }
 
-impl TryFrom<MachineSnapshotPgJson> for Machine {
+impl TryFrom<MachineSnapshotPgJson> for AnyMachine {
     type Error = sqlx::Error;
-
-    fn try_from(value: MachineSnapshotPgJson) -> sqlx::Result<Self> {
+    fn try_from(value: MachineSnapshotPgJson) -> Result<Self, Self::Error> {
         let hardware_info = value
             .topology
             .into_iter()
@@ -341,6 +358,8 @@ impl TryFrom<MachineSnapshotPgJson> for Machine {
             rack_id: value.rack_id,
             config: MachineConfig {
                 firmware_autoupdate: value.firmware_autoupdate,
+                nic_firmware_profile_id: value.nic_firmware_profile_id,
+                nic_firmware_card_selections: value.nic_firmware_card_selections,
                 instance_type_id: value.instance_type_id,
                 dpf: value.dpf,
                 hw_sku: value.hw_sku,
@@ -365,11 +384,12 @@ impl TryFrom<MachineSnapshotPgJson> for Machine {
                 hw_sku: value.hw_sku_status,
                 hw_sku_device_type: value.hw_sku_device_type,
                 update_complete: value.update_complete,
-                backend_firmware_object_job_id: value.backend_firmware_object_job_id,
                 nvlink_info: value.nvlink_info,
                 infiniband_status_observation: value.infiniband_status_observation,
                 nvlink_status_observation: value.nvlink_status_observation,
                 spx_status_observation: value.spx_status_observation,
+                spx_multiplane_status: value.spx_multiplane_status,
+                mlx_device_observation: value.mlx_device_observation,
                 extension_service_status_observations: value.extension_service_status_observations,
                 slot_number: value.slot_number,
                 tray_index: value.tray_index,
@@ -378,6 +398,7 @@ impl TryFrom<MachineSnapshotPgJson> for Machine {
             health_reports,
             reprovision_requested: value.reprovisioning_requested,
             host_reprovision_requested: value.host_reprovisioning_requested,
+            reset_requested: value.reset_requested,
             dpu_agent_upgrade_requested: value.dpu_agent_upgrade_requested,
             controller_state_outcome: value.controller_state_outcome,
             bios_password_set_time: value.bios_password_set_time,
@@ -390,21 +411,155 @@ impl TryFrom<MachineSnapshotPgJson> for Machine {
             host_profile: value.host_profile,
             rack_fw_details: value.rack_fw_details,
             machine_maintenance_requested: value.machine_maintenance_requested,
+            spx_multiplane: value.spx_multiplane,
             decommission_requested: value.decommission_requested,
             bmc_credential_rotation_requested: value.bmc_credential_rotation_requested,
             uefi_credential_rotation_requested: value.uefi_credential_rotation_requested,
+            lockdown_ikm_credential_rotation_requested: value
+                .lockdown_ikm_credential_rotation_requested,
             manual_firmware_upgrade_completed: value.manual_firmware_upgrade_completed,
         })
     }
 }
 
+macro_rules! delegate_try_from_machine_snapshot_pg_json_impl {
+    ($type:ty) => {
+        impl TryFrom<MachineSnapshotPgJson> for $type {
+            type Error = sqlx::Error;
+
+            fn try_from(value: MachineSnapshotPgJson) -> Result<Self, Self::Error> {
+                AnyMachine::try_from(value)?
+                    .try_into_subtype()
+                    .map_err(|e| sqlx::Error::ColumnDecode {
+                        index: "id".to_string(),
+                        source: Box::new(e),
+                    })
+            }
+        }
+    };
+}
+
+delegate_try_from_machine_snapshot_pg_json_impl!(HostMachine);
+delegate_try_from_machine_snapshot_pg_json_impl!(DpuMachine);
+delegate_try_from_machine_snapshot_pg_json_impl!(PredictedHostMachine);
+delegate_try_from_machine_snapshot_pg_json_impl!(StableHostMachine);
+
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::{Fails, Yields};
-    use carbide_test_support::{Case, check_cases};
+    use carbide_test_support::{Case, Check, check_cases, check_values};
 
     use super::*;
     use crate::machine_boot_interface::MachineBootInterface;
+    use crate::nic_firmware::NicFirmwareCardSelector;
+    use crate::test_support::machine_snapshot::{host_machine_id, machine_snapshot_pg_json};
+
+    /// DPU snapshot projections and older fixtures omit the card collection.
+    /// Omission must decode as empty, while host selections reach machine config.
+    #[test]
+    fn nic_firmware_card_selections_decode_from_omitted_and_populated_fields() {
+        let card_selection = NicFirmwareCardSelection {
+            selector: NicFirmwareCardSelector::Guid("opaque-Base_Guid".into()),
+            profile_id: "operator-profile".parse().unwrap(),
+        };
+        check_values(
+            [
+                Check {
+                    scenario: "omitted projection field means no card selections",
+                    input: None,
+                    expect: vec![],
+                },
+                Check {
+                    scenario: "stored card selection reaches machine configuration",
+                    input: Some(vec![card_selection.clone()]),
+                    expect: vec![card_selection],
+                },
+            ],
+            |card_selections| {
+                let mut json = serde_json::to_value(machine_snapshot_pg_json(host_machine_id()))
+                    .expect("serialize machine snapshot");
+                let fields = json.as_object_mut().expect("snapshot is an object");
+                match card_selections {
+                    Some(card_selections) => {
+                        fields.insert(
+                            "nic_firmware_card_selections".into(),
+                            serde_json::to_value(card_selections)
+                                .expect("serialize card selections"),
+                        );
+                    }
+                    None => {
+                        fields.remove("nic_firmware_card_selections");
+                    }
+                }
+                let snapshot: MachineSnapshotPgJson =
+                    serde_json::from_value(json).expect("deserialize machine snapshot");
+                AnyMachine::try_from(snapshot)
+                    .expect("convert machine snapshot")
+                    .config
+                    .nic_firmware_card_selections
+            },
+        );
+    }
+
+    #[test]
+    fn spx_multiplane_survives_snapshot_decoding_and_machine_id_conversion() {
+        use crate::machine::spx_multiplane::MachineSpxMultiplaneInterface;
+        use crate::test_support::machine_snapshot::{host_machine_id, machine_snapshot_pg_json};
+
+        let configuration = MachineSpxMultiplane {
+            interfaces: std::collections::BTreeMap::from([
+                (
+                    "eth_r2_p6".to_string(),
+                    MachineSpxMultiplaneInterface {
+                        cfg_maintenance_mode: Some(true),
+                        reference: Some("https://example.com/ticket/123".to_string()),
+                        revision: ConfigVersion::new(7),
+                    },
+                ),
+                (
+                    "eth_r0_p1".to_string(),
+                    MachineSpxMultiplaneInterface {
+                        cfg_maintenance_mode: Some(false),
+                        reference: None,
+                        revision: ConfigVersion::new(3),
+                    },
+                ),
+            ]),
+        };
+        check_cases(
+            [
+                Case {
+                    scenario: "snapshot predates the column",
+                    input: None,
+                    expect: Yields(None),
+                },
+                Case {
+                    scenario: "non-Astra machine has null configuration",
+                    input: Some(serde_json::Value::Null),
+                    expect: Yields(None),
+                },
+                Case {
+                    scenario: "Astra snapshot retains explicit on and off requests",
+                    input: Some(serde_json::to_value(&configuration).unwrap()),
+                    expect: Yields(Some(configuration)),
+                },
+            ],
+            |field| -> Result<Option<MachineSpxMultiplane>, String> {
+                let mut json =
+                    serde_json::to_value(machine_snapshot_pg_json(host_machine_id())).unwrap();
+                match field {
+                    Some(value) => json["spx_multiplane"] = value,
+                    None => {
+                        json.as_object_mut().unwrap().remove("spx_multiplane");
+                    }
+                }
+                let snapshot: MachineSnapshotPgJson =
+                    serde_json::from_value(json).map_err(|error| error.to_string())?;
+                let machine = HostMachine::try_from(snapshot).map_err(|error| error.to_string())?;
+                Ok(machine.spx_multiplane)
+            },
+        );
+    }
 
     #[derive(Debug)]
     struct Input {

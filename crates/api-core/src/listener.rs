@@ -22,16 +22,19 @@ use std::time::{Duration, Instant};
 use ::rpc::forge as rpc;
 use carbide_authn::SpiffeContext;
 use carbide_authn::middleware::{CertDescriptionMiddleware, ConnectionAttributes};
-use hyper::server::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper::server::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulConnection;
 use hyper_util::service::TowerToHyperService;
 use model::ConfigValidationError;
 use opentelemetry::metrics::Meter;
 use rustls::server::WebPkiClientVerifier;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tonic_reflection::server::Builder;
 use tower_http::add_extension::AddExtensionLayer;
@@ -52,9 +55,6 @@ use crate::node_auth::NodeJwtValidator;
 /// handle, it returns the axum router holding those pages. The web crate installs
 /// admission after its authentication middleware so fair scheduling sees the
 /// authenticated user identity.
-///
-/// `None` means "don't serve the admin UI at all" -- used by the in-process test
-/// servers, which only exercise the gRPC API and never load the web pages.
 pub type AdminUiRoutesBuilder = Box<
     dyn FnOnce(Arc<Api>, Option<AdminAdmissionControl>) -> eyre::Result<NormalizePath<axum::Router>>
         + Send,
@@ -83,6 +83,12 @@ const TLS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// identity file amplify inbound traffic into a rebuild per connection.
 const TLS_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(15);
 
+/// Overall deadline for an accepted TCP connection to complete its TLS
+/// handshake. A handshake needs only a few network round trips; ten seconds
+/// tolerates transient delay while preventing a silent peer from retaining a
+/// socket indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Reads the client-CA bundle. Split out so one read can feed both the TLS
 /// acceptor and the node-auth validator: each building from its own read lets a
 /// cert-manager rotation land between them, which would install an acceptor
@@ -94,6 +100,31 @@ fn read_client_ca(tls_config: &ApiTlsConfig) -> Option<Vec<u8>> {
     std::fs::read(&tls_config.root_cafile_path)
         .inspect_err(|error| tracing::error!(?error, "error reading root ca cert file"))
         .ok()
+}
+
+/// Adds every certificate in `pem` to `roots`, or returns `None` if the bundle
+/// has no certificates or any of them is not a valid trust anchor. PEM framing
+/// alone does not prove a certificate is usable DER, and
+/// `add_parsable_certificates` silently drops the ones that are not; accepting a
+/// partial bundle would let a bad rotation replace working trust.
+fn add_ca_bundle(roots: &mut RootCertStore, pem: &[u8], path: &str) -> Option<()> {
+    let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+        .collect::<Result<Vec<_>, _>>()
+        .inspect_err(|error| {
+            tracing::error!(path, ?error, "error parsing ca cert file");
+        })
+        .ok()?;
+    let (added, ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 || ignored > 0 {
+        tracing::error!(
+            path,
+            added,
+            ignored,
+            "ca cert file has no valid trust anchors or contains invalid certificates"
+        );
+        return None;
+    }
+    Some(())
 }
 
 /// this function blocks, don't use it in a raw async context
@@ -135,24 +166,24 @@ fn get_tls_acceptor(tls_config: &ApiTlsConfig, client_ca_pem: &[u8]) -> Option<T
 
     let roots = {
         let mut roots = RootCertStore::empty();
-        let mut cert_cursor = std::io::Cursor::new(client_ca_pem);
-        let certs_to_add = rustls_pemfile::certs(&mut cert_cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .inspect_err(|error| {
-                tracing::error!(?error, "error parsing root ca cert file");
-            })
-            .ok()?;
-        let (_added, _ignored) = roots.add_parsable_certificates(certs_to_add);
+        add_ca_bundle(&mut roots, client_ca_pem, &tls_config.root_cafile_path)?;
 
-        if let Ok(pem_file) = std::fs::read(&tls_config.admin_root_cafile_path) {
-            let mut cert_cursor = std::io::Cursor::new(&pem_file[..]);
-            let certs_to_add = rustls_pemfile::certs(&mut cert_cursor)
-                .collect::<Result<Vec<_>, _>>()
-                .inspect_err(|error| {
-                    tracing::error!(?error, "error parsing admin ca cert file");
-                })
-                .ok()?;
-            let (_added, _ignored) = roots.add_parsable_certificates(certs_to_add);
+        // A missing admin CA file means no admin CA is deployed. Any other
+        // outcome must fail the rebuild, or a bad rotation would silently
+        // drop admin trust while the site CA still lets the acceptor build.
+        match std::fs::read(&tls_config.admin_root_cafile_path) {
+            Ok(pem_file) => {
+                add_ca_bundle(&mut roots, &pem_file, &tls_config.admin_root_cafile_path)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::error!(
+                    path = %tls_config.admin_root_cafile_path,
+                    ?error,
+                    "error reading admin ca cert file"
+                );
+                return None;
+            }
         }
         Arc::new(roots)
     };
@@ -231,18 +262,16 @@ struct TlsConnectionAttempted;
 struct TlsConnectionSucceeded;
 
 /// Why an inbound connection failed, as the bounded `reason` label. The
-/// rendered strings are the metric's contract: each variant renders to the
-/// snake_case value the counter has always reported, byte for byte.
-// The shared `ConnectionFailure` postfix is deliberate: the derived snake_case
-// is exactly the `reason` label value the counter reports, so the variant
-// names are the metric contract rather than a naming slip.
-#[allow(clippy::enum_variant_names)]
+/// rendered strings are the metric's contract. Existing variants preserve the
+/// snake_case values the counter previously reported, byte for byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, carbide_instrument::LabelValue)]
 enum ConnectionFailReason {
     /// The TCP accept itself errored.
     TcpConnectionFailure,
     /// The TLS handshake errored.
     TlsConnectionFailure,
+    /// The TLS handshake did not complete before its deadline.
+    TlsHandshakeTimeout,
 }
 
 /// The one metric the Events below record.
@@ -274,9 +303,10 @@ struct TcpAcceptFailed {
     error: String,
 }
 
-/// `TlsConnectionFailed` records a handshake error after the listener knows
-/// the peer. It shares the failure counter with [`TcpAcceptFailed`], while
-/// `peer_address` and `error` remain available only on the diagnostic record.
+/// `TlsConnectionFailed` records a handshake error or deadline expiry after
+/// the listener knows the peer. It shares the failure counter with
+/// [`TcpAcceptFailed`], while `peer_address` and `error` remain available only
+/// on the diagnostic record.
 #[derive(carbide_instrument::Event)]
 #[event(
     event_name = "api_tls_connection_failed",
@@ -291,6 +321,45 @@ struct TlsConnectionFailed {
     error: String,
     #[context]
     peer_address: SocketAddr,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TlsAcceptError {
+    #[error(transparent)]
+    Handshake(#[from] std::io::Error),
+    #[error("TLS handshake timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+}
+
+impl TlsAcceptError {
+    fn failure_reason(&self) -> ConnectionFailReason {
+        match self {
+            Self::Handshake(_) => ConnectionFailReason::TlsConnectionFailure,
+            Self::Timeout { .. } => ConnectionFailReason::TlsHandshakeTimeout,
+        }
+    }
+
+    fn record(self, peer_address: SocketAddr) {
+        let reason = self.failure_reason();
+        carbide_instrument::emit(TlsConnectionFailed {
+            reason,
+            error: self.to_string(),
+            peer_address,
+        });
+    }
+}
+
+async fn accept_tls_connection(
+    tls_acceptor: &TlsAcceptor,
+    connection: TcpStream,
+    handshake_timeout: Duration,
+) -> Result<TlsStream<TcpStream>, TlsAcceptError> {
+    tokio::time::timeout(handshake_timeout, tls_acceptor.accept(connection))
+        .await
+        .map_err(|_| TlsAcceptError::Timeout {
+            timeout: handshake_timeout,
+        })?
+        .map_err(TlsAcceptError::from)
 }
 
 /// Start listening for requests, spawning the listener task into `join_set`.
@@ -335,7 +404,14 @@ pub(crate) async fn start(
     let listener = TcpListener::bind(listen_port).await?;
     let listen_address = listener.local_addr()?;
     tracing::info!(effective_listen_address = %listen_address, "API listener started");
-    let http = http2::Builder::new(TokioExecutor::new());
+    let mut http = http2::Builder::new(TokioExecutor::new());
+    // Ping idle connections so peers that vanish without a clean close get reaped instead of leaking fds.
+    // The timer is required: keep-alive drives its interval through it, and hyper panics without one.
+    // The timeout starts after each ping, so it may be shorter than the interval:
+    // https://docs.rs/hyper/latest/hyper/server/conn/http2/struct.Builder.html#method.keep_alive_timeout
+    http.timer(TokioTimer::new())
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
 
     let extra_cli_certs = if let Some(auth_config) = auth_config {
         auth_config.cli_certs.clone()
@@ -393,7 +469,7 @@ pub(crate) async fn start(
             (node_jwt_validator, true, false) => {
                 eyre::bail!(
                     "the TLS acceptor could not be built from the configured identity \
-                     certificate and key; refusing to start, because the listener would \
+                     certificate and key, or the site or admin client CA bundle; refusing to start, because the listener would \
                      serve plaintext on a TLS-configured port{}",
                     if node_jwt_validator.is_some() {
                         " while accepting node-auth bearer tokens"
@@ -437,7 +513,7 @@ pub(crate) async fn start(
         None
     } else {
         Some(AsyncRequireAuthorizationLayer::new(
-            auth::middleware::InternalRBACHandler::new(),
+            auth::middleware::InternalRBACHandler::new(auth_config.as_ref()),
         ))
     };
 
@@ -613,12 +689,17 @@ pub(crate) async fn start(
                 let tls_acceptor = tls_acceptor.clone();
                 let http = http.clone();
                 let app = app.clone();
+                // Give the handler a child token of the global one, in case we want to cancel it
+                // independently.
+                let handler_cancel_token = cancel_token.child_token();
 
                 tokio::task::Builder::new()
                     .name("http conn handler")
                     .spawn(async move {
                         if let Some(tls_acceptor) = tls_acceptor {
-                            match tls_acceptor.accept(conn).await {
+                            match accept_tls_connection(&tls_acceptor, conn, TLS_HANDSHAKE_TIMEOUT)
+                                .await
+                            {
                                 Ok(conn) => {
                                     let conn = TokioIo::new(conn);
                                     carbide_instrument::emit(TlsConnectionSucceeded);
@@ -642,26 +723,17 @@ pub(crate) async fn start(
                                         .layer(conn_attrs_extension_layer)
                                         .service(app);
 
-                                    if let Err(error) = http
-                                        .serve_connection(
+                                    serve_with_graceful_shutdown(
+                                        http.serve_connection(
                                             conn,
                                             TowerToHyperService::new(app_with_ext),
-                                        )
-                                        .await
-                                    {
-                                        tracing::debug!(
-                                            %error,
-                                            error_debug = ?error,
-                                            "error servicing tls http request",
-                                        );
-                                    }
+                                        ),
+                                        handler_cancel_token,
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
-                                    carbide_instrument::emit(TlsConnectionFailed {
-                                        reason: ConnectionFailReason::TlsConnectionFailure,
-                                        error: error.to_string(),
-                                        peer_address: addr,
-                                    });
+                                    error.record(addr);
                                 }
                             }
                         } else {
@@ -680,26 +752,29 @@ pub(crate) async fn start(
                                 .layer(conn_attrs_extension_layer)
                                 .service(app);
 
-                            let result = if serve_plaintext_via_http1 {
+                            if serve_plaintext_via_http1 {
                                 // Serve the connection as HTTP/1.1 and allow upgrading to HTTP/2
-                                http1::Builder::new()
-                                    .serve_connection(conn, TowerToHyperService::new(app_with_ext))
-                                    .with_upgrades()
-                                    .await
+                                serve_with_graceful_shutdown(
+                                    auto::Builder::new(TokioExecutor::new())
+                                        .serve_connection_with_upgrades(
+                                            conn,
+                                            TowerToHyperService::new(app_with_ext),
+                                        ),
+                                    handler_cancel_token,
+                                )
+                                .await;
                             } else {
                                 // Serve the connection as HTTP/2, which will fail if the initial
                                 // request is HTTP/1.1 (which is the default behavior for web browsers,
                                 // curl, etc.)
-                                http.serve_connection(conn, TowerToHyperService::new(app_with_ext))
-                                    .await
-                            };
-
-                            if let Err(error) = result {
-                                tracing::debug!(
-                                    error = %error,
-                                    error_debug = ?error,
-                                    "error servicing plain http connection",
-                                );
+                                serve_with_graceful_shutdown(
+                                    http.serve_connection(
+                                        conn,
+                                        TowerToHyperService::new(app_with_ext),
+                                    ),
+                                    handler_cancel_token,
+                                )
+                                .await;
                             }
                         }
                     })
@@ -711,6 +786,37 @@ pub(crate) async fn start(
         })?;
 
     Ok(listen_address)
+}
+
+/// Helper to serve and await an HTTP connection, while gracefully shutting it down if the given
+/// [`CancellationToken`] is cancelled. For HTTP2 connections, this sends an HTTP/2
+/// [GOAWAY frame][0] on the connection so that no new streams can be opened. For HTTP1 connections
+/// it will disable keepalive on the connection, which should cause it to disconnect after the
+/// next response.
+///
+/// [0]: https://httpwg.org/specs/rfc7540.html#GOAWAY
+async fn serve_with_graceful_shutdown<C>(connection: C, cancel_token: CancellationToken)
+where
+    C: GracefulConnection,
+    C::Error: std::fmt::Display + std::fmt::Debug,
+{
+    tokio::pin!(connection);
+
+    let result = tokio::select! {
+        result = &mut connection => result,
+        () = cancel_token.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+
+    if let Err(error) = result {
+        tracing::debug!(
+            error = %error,
+            error_debug = ?error,
+            "error servicing connection",
+        );
+    }
 }
 
 /// Handle the root URL. Health check services often expect a 200 here.
@@ -725,12 +831,22 @@ async fn root_url() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use carbide_instrument::testing::{MetricsCapture, capture_logs};
     use carbide_test_support::{Check, check_values};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
 
-    use super::{ConnectionFailReason, TcpAcceptFailed, TlsCertsRefreshed, TlsConnectionFailed};
+    use super::{
+        ApiTlsConfig, ConnectionFailReason, TcpAcceptFailed, TlsAcceptError, TlsCertsRefreshed,
+        accept_tls_connection, get_tls_acceptor,
+    };
 
     const FAILURE_METRIC: &str = "carbide_api_tls_connection_fail_total";
     const TLS_CERT_REFRESH_METRIC: &str = "carbide_api_tls_cert_refreshes_total";
@@ -766,13 +882,22 @@ mod tests {
     }
 
     fn emit_tls_connection_failure() {
-        carbide_instrument::emit(TlsConnectionFailed {
-            reason: ConnectionFailReason::TlsConnectionFailure,
-            error: "handshake failed".to_string(),
-            peer_address: "192.0.2.10:443"
+        TlsAcceptError::Handshake(std::io::Error::other("handshake failed")).record(
+            "192.0.2.10:443"
                 .parse::<SocketAddr>()
                 .expect("test peer address is valid"),
-        });
+        );
+    }
+
+    fn emit_tls_handshake_timeout() {
+        TlsAcceptError::Timeout {
+            timeout: Duration::from_secs(10),
+        }
+        .record(
+            "192.0.2.11:443"
+                .parse::<SocketAddr>()
+                .expect("test peer address is valid"),
+        );
     }
 
     fn observe_failure(input: FailureInput) -> FailureObservation {
@@ -826,8 +951,157 @@ mod tests {
         }
     }
 
+    fn test_tls_acceptor() -> TlsAcceptor {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("test certificate generation succeeds");
+        let private_key =
+            rustls_pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+        let config = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions are supported")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .expect("test certificate and key form a valid server identity");
+
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// What the admin CA file holds when the acceptor is rebuilt.
+    enum AdminCa {
+        Valid,
+        Missing,
+        Empty,
+        /// Valid PEM framing and base64, but the body is not a DER certificate.
+        InvalidDer,
+        /// A valid certificate followed by one that is not DER.
+        PartiallyInvalid,
+    }
+
+    fn ca_pem() -> String {
+        let params = rcgen::CertificateParams::new(vec![]).expect("params");
+        let key = rcgen::KeyPair::generate().expect("key");
+        params.self_signed(&key).expect("self-signed").pem()
+    }
+
+    fn invalid_der_pem() -> String {
+        "-----BEGIN CERTIFICATE-----\naW52YWxpZA==\n-----END CERTIFICATE-----\n".to_string()
+    }
+
+    /// A rebuild that cannot trust every configured admin CA must fail, so the
+    /// refresh keeps the previous acceptor instead of dropping admin trust.
+    #[test]
+    fn acceptor_rebuild_requires_fully_valid_ca_bundles() {
+        use p256::pkcs8::{DecodePrivateKey, LineEnding};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("test certificate generation succeeds");
+        let sec1_key = p256::SecretKey::from_pkcs8_pem(&identity.signing_key.serialize_pem())
+            .expect("pkcs8 parses")
+            .to_sec1_pem(LineEnding::LF)
+            .expect("sec1 encodes");
+        let write = |name: &str, contents: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).expect("write fixture");
+            path.to_string_lossy().into_owned()
+        };
+        let site_ca = ca_pem();
+        let invalid_site_ca = invalid_der_pem();
+        let config = ApiTlsConfig {
+            identity_pemfile_path: write("identity.pem", &identity.cert.pem()),
+            identity_keyfile_path: write("identity.key", sec1_key.as_str()),
+            root_cafile_path: write("site_ca.pem", &site_ca),
+            admin_root_cafile_path: dir
+                .path()
+                .join("admin_ca.pem")
+                .to_string_lossy()
+                .into_owned(),
+        };
+
+        check_values(
+            [
+                Check {
+                    scenario: "valid admin CA",
+                    input: AdminCa::Valid,
+                    expect: true,
+                },
+                Check {
+                    scenario: "no admin CA deployed",
+                    input: AdminCa::Missing,
+                    expect: true,
+                },
+                Check {
+                    scenario: "empty admin CA file",
+                    input: AdminCa::Empty,
+                    expect: false,
+                },
+                Check {
+                    scenario: "admin CA that is not DER",
+                    input: AdminCa::InvalidDer,
+                    expect: false,
+                },
+                Check {
+                    scenario: "admin CA bundle with one invalid certificate",
+                    input: AdminCa::PartiallyInvalid,
+                    expect: false,
+                },
+            ],
+            |admin_ca| {
+                let _ = std::fs::remove_file(&config.admin_root_cafile_path);
+                let contents = match admin_ca {
+                    AdminCa::Valid => Some(ca_pem()),
+                    AdminCa::Missing => None,
+                    AdminCa::Empty => Some(String::new()),
+                    AdminCa::InvalidDer => Some(invalid_der_pem()),
+                    AdminCa::PartiallyInvalid => Some(ca_pem() + invalid_der_pem().as_str()),
+                };
+                if let Some(contents) = contents {
+                    std::fs::write(&config.admin_root_cafile_path, contents).expect("write admin");
+                }
+                get_tls_acceptor(&config, site_ca.as_bytes()).is_some()
+            },
+        );
+
+        // The site bundle is held to the same standard, and no admin CA can
+        // make up for it.
+        std::fs::write(&config.admin_root_cafile_path, ca_pem()).expect("write admin");
+        assert!(
+            get_tls_acceptor(&config, invalid_site_ca.as_bytes()).is_none(),
+            "site CA that is not DER"
+        );
+    }
+
+    /// A peer that opens TCP but sends no TLS bytes cannot retain the server
+    /// socket beyond the handshake deadline.
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_tls_handshake_is_closed_after_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener binds");
+        let listener_address = listener.local_addr().expect("test listener has an address");
+        let mut client = TcpStream::connect(listener_address)
+            .await
+            .expect("test client connects");
+        let (server, _) = listener.accept().await.expect("test listener accepts");
+
+        let error = accept_tls_connection(&test_tls_acceptor(), server, Duration::from_millis(10))
+            .await
+            .expect_err("an incomplete TLS handshake must time out");
+        assert!(matches!(error, TlsAcceptError::Timeout { .. }));
+
+        let mut byte = [0];
+        let bytes_read = client
+            .read(&mut byte)
+            .await
+            .expect("server closes the timed-out connection cleanly");
+        assert_eq!(bytes_read, 0);
+    }
+
     /// Each accept or handshake failure writes one ERROR record and increments
-    /// exactly one existing `reason` series.
+    /// exactly one bounded `reason` series.
     #[test]
     fn connection_failures_emit_their_metric_and_historical_log() {
         check_values(
@@ -858,6 +1132,20 @@ mod tests {
                         "tls_connection_failure",
                         "handshake failed",
                         Some("192.0.2.10:443"),
+                    ),
+                },
+                Check {
+                    scenario: "tls handshake timeout",
+                    input: FailureInput {
+                        reason: "tls_handshake_timeout",
+                        emit: emit_tls_handshake_timeout,
+                    },
+                    expect: expected_failure(
+                        "api_tls_connection_failed",
+                        "error accepting tls connection",
+                        "tls_handshake_timeout",
+                        "TLS handshake timed out after 10s",
+                        Some("192.0.2.11:443"),
                     ),
                 },
             ],

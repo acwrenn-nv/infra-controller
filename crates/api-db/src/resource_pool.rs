@@ -14,10 +14,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+pub mod allocation;
+pub mod binding;
+pub mod registration;
+pub mod remote;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use carbide_instrument::{Event, LabelValue, MetricFamily, emit};
 use config_version::ConfigVersion;
@@ -33,11 +38,11 @@ use model::resource_pool::{
     ResourcePoolSnapshot, ResourcePoolStats, ValueType,
 };
 use sqlx::{PgConnection, Postgres};
-use tokio::sync::oneshot;
 
 use super::BIND_LIMIT;
-use crate::DatabaseError;
+use crate::config_drift::{ConfigDefinitionDrifted, ConfigDriftKind, ConfigResourceKind};
 use crate::db_read::DbReader;
+use crate::{ConditionalWrite, DatabaseError, Transaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
 pub(crate) enum ResourcePoolOperation {
@@ -48,6 +53,7 @@ pub(crate) enum ResourcePoolOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
 pub(crate) enum ResourcePoolFailure {
     Exhausted,
+    Configuration,
     RequestedValueUnavailable,
     Parse,
     Database,
@@ -266,7 +272,18 @@ where
     Ok(())
 }
 
-/// Get a resource from the pool
+/// `allocate` reserves a value from the automatic or explicit assignment partition.
+/// Returns [`ResourcePoolError::MissingAllocationRange`] when the selected
+/// partition has no configured values, or [`ResourcePoolError::Empty`] when
+/// all of its configured values are allocated.
+///
+/// An omitted `requested_value` requires `auto_assign=true`; an exact request
+/// requires `auto_assign=false`. Use [`allocate_exact`] when an exact request
+/// may claim a free value from either partition.
+///
+/// The allocation statement also inserts the shared [`allocation`] record,
+/// including on an autocommit connection. If that record cannot be written, the
+/// inventory write rolls back too.
 pub async fn allocate<T>(
     value: &ResourcePool<T>,
     txn: &mut PgConnection,
@@ -282,7 +299,7 @@ where
 
     let query = "
 WITH allocate AS (
- SELECT id, value FROM resource_pool
+ SELECT id FROM resource_pool
     WHERE
         name = $1
         AND state = $2
@@ -293,13 +310,24 @@ WITH allocate AS (
     ORDER BY random()
     LIMIT 1
     FOR UPDATE SKIP LOCKED
+), allocated AS (
+    UPDATE resource_pool SET
+        state=$3,
+        allocated=NOW()
+    FROM allocate
+    WHERE resource_pool.id = allocate.id
+    RETURNING resource_pool.id, resource_pool.name, resource_pool.value,
+        resource_pool.value_type, resource_pool.state, resource_pool.auto_assign,
+        resource_pool.allocated
 )
-UPDATE resource_pool SET
-    state=$3,
-    allocated=NOW()
-FROM allocate
-WHERE resource_pool.id = allocate.id
-RETURNING allocate.value
+INSERT INTO resource_pool_allocations (
+    pool_name, owner_type, owner_id, state, integrated_resource_id,
+    value, value_type, auto_assign, allocated_at
+)
+SELECT name, state->>'owner_type', state->>'owner', 'attached', id,
+    value, value_type, auto_assign, allocated
+FROM allocated
+RETURNING value
 ";
     let free_state = ResourcePoolEntryState::Free;
     let allocated_state = ResourcePoolEntryState::Allocated {
@@ -321,8 +349,7 @@ RETURNING allocate.value
 
     // A successful allocation is a single round-trip. The pool-state accounting
     // (`stats`) is consulted only when the allocation statement returns no row,
-    // so it never burdens the common success path — while the error it produces
-    // is exactly what an up-front pre-scan would have returned.
+    // so it never burdens the common success path.
     //
     // Concurrency note: the accounting now reads pool state at failure time
     // rather than before the allocation attempt, so a caller losing a race
@@ -335,20 +362,24 @@ RETURNING allocate.value
         Ok(row) => row,
         Err(sqlx::Error::RowNotFound) => {
             let stats = stats(&mut *txn, value.name()).await?;
-            let free = if auto_assign {
-                stats.auto_assign_free
+            let (free, used) = if auto_assign {
+                (stats.auto_assign_free, stats.auto_assign_used)
             } else {
-                stats.non_auto_assign_free
+                (stats.non_auto_assign_free, stats.non_auto_assign_used)
             };
             if free == 0 {
-                // The relevant partition of the pool is exhausted.
-                return Err(ResourcePoolError::Empty.into());
+                if used != 0 {
+                    return Err(ResourcePoolError::Empty.into());
+                }
+                return Err(ResourcePoolError::MissingAllocationRange {
+                    pool_name: value.name().to_string(),
+                    auto_assign,
+                }
+                .into());
             }
             if !auto_assign {
-                // A specific value was requested and the pool has free
-                // non-auto-assign entries, but this value is not one of them:
-                // it was either already allocated or it is not a value that is
-                // allowed to be explicitly requested.
+                // The value is already allocated or cannot be explicitly
+                // requested, even though other explicit values remain free.
                 return Err(DatabaseError::FailedPrecondition(format!(
                     "`{}` not an available value for resource-pool `{}`",
                     req.unwrap_or_default(),
@@ -373,6 +404,61 @@ RETURNING allocate.value
             owner_id: owner_id.to_string(),
         })?;
     Ok(out)
+}
+
+/// `allocate_exact` reserves a specific free value from either assignment partition.
+///
+/// Unlike [`allocate`], this accepts and preserves either `auto_assign` setting.
+/// It atomically records the owner, allocation time, and shared [`allocation`]
+/// record, then returns the requested value.
+/// Missing or allocated values return [`DatabaseError::FailedPrecondition`],
+/// including values already reserved by the same owner. Callers must handle
+/// retained allocations separately. The claim participates in the supplied
+/// transaction and waits for conflicting row locks.
+pub async fn allocate_exact<T>(
+    pool: &ResourcePool<T>,
+    txn: &mut PgConnection,
+    owner_type: OwnerType,
+    owner_id: &str,
+    requested_value: T,
+) -> Result<T, DatabaseError>
+where
+    T: ToString + FromStr + Send + Sync + 'static,
+    <T as FromStr>::Err: std::error::Error,
+{
+    let requested_value_text = requested_value.to_string();
+    let allocated_state = ResourcePoolEntryState::Allocated {
+        owner: owner_id.to_string(),
+        owner_type: owner_type.to_string(),
+    };
+    let query = "WITH allocated AS (
+        UPDATE resource_pool SET state = $1, allocated = NOW()
+        WHERE name = $2 AND value = $3 AND state = $4
+        RETURNING id, name, value, value_type, state, auto_assign, allocated
+    )
+    INSERT INTO resource_pool_allocations (
+        pool_name, owner_type, owner_id, state, integrated_resource_id,
+        value, value_type, auto_assign, allocated_at
+    )
+    SELECT name, state->>'owner_type', state->>'owner', 'attached', id,
+        value, value_type, auto_assign, allocated
+    FROM allocated";
+    let result = sqlx::query(query)
+        .bind(sqlx::types::Json(&allocated_state))
+        .bind(pool.name())
+        .bind(&requested_value_text)
+        .bind(sqlx::types::Json(ResourcePoolEntryState::Free))
+        .execute(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    if result.rows_affected() == 0 {
+        return Err(DatabaseError::FailedPrecondition(format!(
+            "`{requested_value_text}` not an available value for resource-pool `{}`",
+            pool.name()
+        )));
+    }
+
+    Ok(requested_value)
 }
 
 /// Returns the value already reserved by one owner in this pool.
@@ -432,34 +518,66 @@ where
         .map_err(Into::into)
 }
 
-/// Return a resource to the pool
+/// Returns a value shared by two integer pools, if any.
+///
+/// This compares materialized entries, including allocated and manually
+/// assigned values, rather than the configured range definitions. It does not
+/// lock the pools or prevent their definitions from changing afterward.
+pub async fn find_pool_overlap(
+    txn: &mut PgConnection,
+    first: &ResourcePool<i32>,
+    second: &ResourcePool<i32>,
+) -> Result<Option<i32>, DatabaseError> {
+    let query = "SELECT first_pool.value::integer FROM resource_pool first_pool
+        JOIN resource_pool second_pool ON first_pool.value = second_pool.value
+        WHERE first_pool.name = $1 AND second_pool.name = $2
+        LIMIT 1";
+    sqlx::query_scalar(query)
+        .bind(first.name())
+        .bind(second.name())
+        .fetch_optional(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+/// `ResourcePoolAllocationNotOwned` means `release` found no allocation for
+/// the expected owner. The value is missing, free, or allocated to another owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePoolAllocationNotOwned;
+
+/// `release` returns a value to the pool only when its owner type and ID match.
+/// Missing, free, and differently owned values return `NotApplied` without
+/// changing the pool. Cleanup callers may accept that as already released;
+/// callers requiring an existing reservation must handle the rejection.
+///
+/// Inventory and its shared [`allocation`] record change atomically, including
+/// on an autocommit connection. An existing caller transaction uses a savepoint
+/// and still requires the caller to commit its outer transaction.
+///
+/// Ownership is not an allocation generation. Callers must separately prevent
+/// an old cleanup from reaching a new allocation for the same owner.
 pub async fn release<T>(
     pool: &ResourcePool<T>,
     txn: &mut PgConnection,
     value: T,
-) -> Result<(), DatabaseError>
+    owner_type: OwnerType,
+    owner_id: &str,
+) -> Result<ConditionalWrite<(), ResourcePoolAllocationNotOwned>, DatabaseError>
 where
     T: ToString + FromStr + Send + Sync + 'static,
     <T as FromStr>::Err: std::error::Error,
 {
-    // TODO: If we would get passed the current owner, we could guard on that
-    // so that nothing else could release the value
     let value = value.to_string();
-    let query = "
-UPDATE resource_pool SET
-  allocated = NULL,
-  state = $1
-WHERE name = $2 AND value = $3
-";
-    if let Err(source) = sqlx::query(query)
-        .bind(sqlx::types::Json(ResourcePoolEntryState::Free))
-        .bind(&pool.name)
-        .bind(&value)
-        .execute(txn)
-        .await
-    {
-        let event_error = source.to_string();
-        let error = DatabaseError::query(query, source);
+    let expected_state = ResourcePoolEntryState::Allocated {
+        owner: owner_id.to_string(),
+        owner_type: owner_type.to_string(),
+    };
+    let result = release_inner(txn, &pool.name, &value, expected_state).await;
+    result.inspect_err(|error| {
+        let event_error = match error {
+            DatabaseError::Sqlx(error) => error.source.to_string(),
+            _ => error.to_string(),
+        };
         emit(ResourcePoolReleaseFailed {
             operation: ResourcePoolOperation::Release,
             failure: ResourcePoolFailure::Database,
@@ -470,9 +588,47 @@ WHERE name = $2 AND value = $3
             pool: pool.name.clone(),
             value,
         });
-        return Err(error);
+    })
+}
+
+async fn release_inner(
+    txn: &mut PgConnection,
+    pool_name: &str,
+    value: &str,
+    expected_state: ResourcePoolEntryState,
+) -> Result<ConditionalWrite<(), ResourcePoolAllocationNotOwned>, DatabaseError> {
+    let query = "
+UPDATE resource_pool SET
+  allocated = NULL,
+  state = $1
+WHERE name = $2 AND value = $3 AND state = $4
+RETURNING id
+";
+    let mut inner_txn = Transaction::begin_inner(txn).await?;
+    let resource_id = sqlx::query_scalar::<_, i64>(query)
+        .bind(sqlx::types::Json(ResourcePoolEntryState::Free))
+        .bind(pool_name)
+        .bind(value)
+        .bind(sqlx::types::Json(expected_state))
+        .fetch_optional(inner_txn.as_pgconn())
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    if let Some(resource_id) = resource_id {
+        // Take a fresh snapshot after the inventory lock: a same-owner
+        // reallocation may have inserted a new record while UPDATE waited.
+        let query = "DELETE FROM resource_pool_allocations
+                WHERE integrated_resource_id = $1";
+        sqlx::query(query)
+            .bind(resource_id)
+            .execute(inner_txn.as_pgconn())
+            .await
+            .map_err(|error| DatabaseError::query(query, error))?;
     }
-    Ok(())
+    inner_txn.commit().await?;
+    Ok(match resource_id {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(ResourcePoolAllocationNotOwned),
+    })
 }
 
 pub async fn stats<'c, E>(executor: E, name: &str) -> Result<ResourcePoolStats, DatabaseError>
@@ -565,6 +721,9 @@ pub async fn all_stored_defs(
         .collect())
 }
 
+/// `all` returns local inventory bounds and counts, ordered by pool name.
+/// Pools do not need a saved backend binding to appear here. Address bounds
+/// omit the host prefix length; delegated IPv6 prefixes retain theirs.
 pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, DatabaseError> {
     let mut out = Vec::with_capacity(4);
 
@@ -589,6 +748,8 @@ pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, Da
                 FROM resource_pool WHERE value_type = 'integer' GROUP BY name
             ) snapshot";
 
+    // IPv4 and IPv6 addresses can share a pool, so group by name rather than
+    // value type. Prefix pools keep their length in the displayed bounds.
     let query_ip_address = "
             SELECT
                 name,
@@ -602,12 +763,18 @@ pub async fn all(txn: &mut PgConnection) -> Result<Vec<ResourcePoolSnapshot>, Da
                 (auto_assign_free + non_auto_assign_free) AS free
             FROM
             (
-                SELECT name, host(min(value::inet)) AS min, host(max(value::inet)) AS max,
+                SELECT name,
+                    CASE WHEN bool_and(value_type = 'ipv6prefix')
+                        THEN min(value::inet)::text
+                        ELSE host(min(value::inet)) END AS min,
+                    CASE WHEN bool_and(value_type = 'ipv6prefix')
+                        THEN max(value::inet)::text
+                        ELSE host(max(value::inet)) END AS max,
                     count(*) FILTER (WHERE state = '{\"state\": \"free\"}' AND auto_assign) AS auto_assign_free,
                     count(*) FILTER (WHERE state != '{\"state\": \"free\"}' AND auto_assign) AS auto_assign_used,
                     count(*) FILTER (WHERE state = '{\"state\": \"free\"}' AND NOT auto_assign) AS non_auto_assign_free,
                     count(*) FILTER (WHERE state != '{\"state\": \"free\"}' AND NOT auto_assign) AS non_auto_assign_used
-                FROM resource_pool WHERE value_type IN ('ipv4', 'ipv6') GROUP BY name
+                FROM resource_pool WHERE value_type IN ('ipv4', 'ipv6', 'ipv6prefix') GROUP BY name
             ) snapshot";
 
     for query in [query_int, query_ip_address] {
@@ -661,6 +828,9 @@ pub(crate) fn classify_resource_pool_failure(
         ResourcePoolDatabaseError::ResourcePool(ResourcePoolError::Empty) => {
             ResourcePoolFailure::Exhausted
         }
+        ResourcePoolDatabaseError::ResourcePool(ResourcePoolError::MissingAllocationRange {
+            ..
+        }) => ResourcePoolFailure::Configuration,
         ResourcePoolDatabaseError::ResourcePool(ResourcePoolError::Parse { .. }) => {
             ResourcePoolFailure::Parse
         }
@@ -669,10 +839,12 @@ pub(crate) fn classify_resource_pool_failure(
 }
 
 fn classify_database_failure(error: &DatabaseError) -> ResourcePoolFailure {
-    if matches!(error, DatabaseError::FailedPrecondition(_)) {
-        ResourcePoolFailure::RequestedValueUnavailable
-    } else {
-        ResourcePoolFailure::Database
+    match error {
+        DatabaseError::ResourcePoolError(ResourcePoolError::MissingAllocationRange { .. }) => {
+            ResourcePoolFailure::Configuration
+        }
+        DatabaseError::FailedPrecondition(_) => ResourcePoolFailure::RequestedValueUnavailable,
+        _ => ResourcePoolFailure::Database,
     }
 }
 
@@ -772,7 +944,8 @@ fn emit_classified_allocation_failure(
             owner_id: owner_id.to_string(),
             pool: diagnostic_pool.to_string(),
         }),
-        ResourcePoolFailure::RequestedValueUnavailable
+        ResourcePoolFailure::Configuration
+        | ResourcePoolFailure::RequestedValueUnavailable
         | ResourcePoolFailure::Parse
         | ResourcePoolFailure::Database => {
             emit(ResourcePoolAllocationFailed {
@@ -893,12 +1066,13 @@ pub async fn reconcile_pool_defs(
             (Some(stored_def), true) if stored_def == def => {}
             // Declaration has drifted since seed. Warn, don't reapply.
             (Some(stored_def), true) => {
-                tracing::warn!(
-                    pool_name = name,
-                    stored = ?stored_def,
-                    declared = ?def,
-                    "Resource Pool definition has changed since it was seeded; not re-applying"
-                );
+                emit(ConfigDefinitionDrifted {
+                    resource_kind: ConfigResourceKind::ResourcePool,
+                    drift_kind: ConfigDriftKind::Changed,
+                    name: name.clone(),
+                    stored: Some(format!("{stored_def:?}")),
+                    declared: Some(format!("{def:?}")),
+                });
             }
             // Pool exists in resource_pool but has no snapshot yet.
             // Pre-migration deployment, or a pool re-added after a snapshot
@@ -924,10 +1098,13 @@ pub async fn reconcile_pool_defs(
 
     for name in stored.keys() {
         if !declared.contains_key(name) {
-            tracing::warn!(
-                pool_name = name,
-                "Resource Pool exists in database but is no longer declared in any config file"
-            );
+            emit(ConfigDefinitionDrifted {
+                resource_kind: ConfigResourceKind::ResourcePool,
+                drift_kind: ConfigDriftKind::Dropped,
+                name: name.clone(),
+                stored: None,
+                declared: None,
+            });
         }
     }
 
@@ -1318,7 +1495,6 @@ fn expand_ipv6_prefix_range(
 
     let start_addr: u128 = start_net.network().into();
     let end_addr: u128 = end_net.network().into();
-    let step = 1u128 << (128 - prefix_len as u32);
 
     if end_addr <= start_addr {
         return Err(DefineResourcePoolError::InvalidArgument(
@@ -1326,6 +1502,8 @@ fn expand_ipv6_prefix_range(
         ));
     }
 
+    // The order check rejects /0 before this would shift by 128 bits.
+    let step = 1u128 << (128 - prefix_len as u32);
     let count = (end_addr - start_addr) / step;
     if count > MAX_POOL_SIZE as u128 {
         return Err(DefineResourcePoolError::TooBig(
@@ -1346,30 +1524,17 @@ fn expand_ipv6_prefix_range(
 
 // All the numbers between start_s and end_s
 fn expand_int_range(start_s: &str, end_s: &str) -> Result<Vec<i64>, eyre::Report> {
-    let start: i64 = parse_int_range(start_s)?;
-    let end: i64 = parse_int_range(end_s)?;
+    let start = resource_pool::parse_integer_range_bound(start_s)?;
+    let end = resource_pool::parse_integer_range_bound(end_s)?;
     Ok((start..end).collect())
 }
 
-const HEX_PRE: &str = "0x";
-
-fn parse_int_range(data: &str) -> Result<i64, eyre::Report> {
-    let data = data.to_lowercase();
-    let base = if data.starts_with(HEX_PRE) { 16 } else { 10 };
-    let p = data.trim_start_matches(HEX_PRE);
-
-    i64::from_str_radix(p, base).map_err(eyre::Report::from)
-}
-
-/// How often to update the resource pool metrics
-const METRICS_RESOURCEPOOL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
+/// Build the shared pool handles after checking that mandatory pools have free values.
 pub async fn create_common_pools(
     db: sqlx::PgPool,
     ib_fabric_ids: HashSet<String>,
 ) -> eyre::Result<Arc<CommonPools>> {
     let mut pool_names = Vec::new();
-    let mut optional_pool_names = Vec::new();
 
     let pool_loopback_ip: Arc<ResourcePool<IpAddr>> =
         Arc::new(ResourcePool::new(LOOPBACK_IP.to_string(), ValueType::Ipv4));
@@ -1378,7 +1543,6 @@ pub async fn create_common_pools(
         LOOPBACK_IP_V6.to_string(),
         ValueType::Ipv6,
     ));
-    optional_pool_names.push(pool_loopback_ip_v6.name().to_string());
     let pool_vlan_id: Arc<ResourcePool<i16>> =
         Arc::new(ResourcePool::new(VLANID.to_string(), ValueType::Integer));
     pool_names.push(pool_vlan_id.name().to_string());
@@ -1390,24 +1554,19 @@ pub async fn create_common_pools(
     pool_names.push(pool_vpc_vni.name().to_string());
     let pool_fnn_asn: Arc<ResourcePool<u32>> =
         Arc::new(ResourcePool::new(FNN_ASN.to_string(), ValueType::Integer));
-    optional_pool_names.push(pool_fnn_asn.name().to_string());
 
     let pool_dpa_vni: Arc<ResourcePool<i32>> =
         Arc::new(ResourcePool::new(DPA_VNI.to_string(), ValueType::Integer));
-    optional_pool_names.push(pool_dpa_vni.name().to_string());
 
     let pool_vpc_dpu_loopback_ip: Arc<ResourcePool<IpAddr>> = Arc::new(ResourcePool::new(
         VPC_DPU_LOOPBACK.to_string(),
         ValueType::Ipv4,
     ));
-    //  TODO: This should be removed from optional once FNN become mandatory.
-    optional_pool_names.push(pool_vpc_dpu_loopback_ip.name().to_string());
 
     let pool_external_vpc_vni: Arc<ResourcePool<i32>> = Arc::new(ResourcePool::new(
         EXTERNAL_VPC_VNI.to_string(),
         ValueType::Integer,
     ));
-    optional_pool_names.push(pool_external_vpc_vni.name().to_string());
 
     // We can't run if any of the mandatory pools are missing
     for name in &pool_names {
@@ -1415,8 +1574,6 @@ pub async fn create_common_pools(
             eyre::bail!("resource pool '{name}' missing or full. edit config file and restart");
         }
     }
-
-    pool_names.extend(optional_pool_names);
 
     // It's ok for IB partition pools to be missing or full - as long as nobody tries to use partitions
     let pkey_pools: Arc<HashMap<String, ResourcePool<u16>>> = Arc::new(
@@ -1433,34 +1590,6 @@ pub async fn create_common_pools(
             })
             .collect(),
     );
-    pool_names.extend(pkey_pools.values().map(|pool| pool.name().to_string()));
-
-    // Gather resource pool stats. A different thread sends them to Prometheus.
-    let (stop_sender, mut stop_receiver) = oneshot::channel();
-    let pool_stats: Arc<Mutex<HashMap<String, ResourcePoolStats>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let pool_stats_bg = pool_stats.clone();
-    tokio::task::Builder::new()
-        .name("resource_pool metrics")
-        .spawn(async move {
-            loop {
-                let mut next_stats = HashMap::with_capacity(pool_names.len());
-                for name in &pool_names {
-                    if let Ok(st) = stats(&db, name).await {
-                        next_stats.insert(name.to_string(), st);
-                    }
-                }
-                *pool_stats_bg.lock().unwrap() = next_stats;
-
-                tokio::select! {
-                    _ = tokio::time::sleep(METRICS_RESOURCEPOOL_INTERVAL) => {},
-                    _ = &mut stop_receiver => {
-                        tracing::info!("CommonPool metrics stop was requested");
-                        return;
-                    }
-                }
-            }
-        })?;
 
     Ok(Arc::new(CommonPools {
         ethernet: EthernetPools {
@@ -1475,20 +1604,21 @@ pub async fn create_common_pools(
             pool_vpc_dpu_loopback_ip,
         },
         infiniband: IbPools { pkey_pools },
-        pool_stats,
-        _stop_sender: stop_sender,
     }))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use std::str::FromStr;
 
     use carbide_instrument::MetricKind;
     use carbide_instrument::testing::{MetricsCapture, capture_logs, capture_logs_async};
     use carbide_test_support::Outcome::*;
     use carbide_test_support::query_counter::count_queries;
-    use carbide_test_support::{Case, Check, check_cases, check_values};
+    use carbide_test_support::{
+        Case, Check, check_cases, check_cases_async, check_values, value_scenarios,
+    };
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::*;
@@ -1825,6 +1955,164 @@ mod tests {
         );
     }
 
+    #[crate::sqlx_test]
+    async fn stale_release_preserves_reallocated_value(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let resource_pool =
+            ResourcePool::new("owner-checked-release".to_string(), ValueType::Integer);
+        let mut txn = pool.begin().await?;
+        populate(&resource_pool, &mut txn, vec![1], true).await?;
+        let value = allocate(&resource_pool, &mut txn, OwnerType::Machine, "A", None).await?;
+        txn.commit().await?;
+
+        let mut new_owner = pool.begin().await?;
+        assert_eq!(
+            release(
+                &resource_pool,
+                &mut new_owner,
+                value,
+                OwnerType::Machine,
+                "A"
+            )
+            .await?,
+            ConditionalWrite::Applied(())
+        );
+        let value = allocate(
+            &resource_pool,
+            &mut new_owner,
+            OwnerType::Machine,
+            "B",
+            None,
+        )
+        .await?;
+        let allocated: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT allocated FROM resource_pool WHERE name = $1 AND value = $2",
+        )
+        .bind(resource_pool.name())
+        .bind(value.to_string())
+        .fetch_one(new_owner.as_mut())
+        .await?;
+        let allocation = allocation::list(
+            new_owner.as_mut(),
+            resource_pool.name(),
+            None,
+            NonZeroU16::new(1).unwrap(),
+        )
+        .await?
+        .remove(0);
+
+        let new_owner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *new_owner)
+            .await?;
+        let mut stale_txn = pool.begin().await?;
+        let stale_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *stale_txn)
+            .await?;
+        let stale_release = async {
+            let result = release(
+                &resource_pool,
+                &mut stale_txn,
+                value,
+                OwnerType::Machine,
+                "A",
+            )
+            .await?;
+            stale_txn.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(result)
+        };
+        let commit_new_owner = async {
+            // A's release sees its previous allocation, then waits for B's
+            // allocation. PostgreSQL must recheck ownership after that wait.
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                    .bind(new_owner_pid)
+                    .bind(stale_pid)
+                    .fetch_one(&pool)
+                    .await?;
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            new_owner.commit().await
+        };
+        let (result, committed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(stale_release, commit_new_owner)
+        })
+        .await
+        .expect("the stale release must finish after the new allocation commits");
+        committed?;
+        assert_eq!(
+            result?,
+            ConditionalWrite::NotApplied(ResourcePoolAllocationNotOwned)
+        );
+        assert_eq!(
+            allocation::load(&pool, allocation.allocation_id)
+                .await?
+                .as_ref(),
+            Some(&allocation)
+        );
+
+        let mut txn = pool.begin().await?;
+        assert_eq!(
+            release(&resource_pool, &mut txn, value, OwnerType::Vpc, "B").await?,
+            ConditionalWrite::NotApplied(ResourcePoolAllocationNotOwned)
+        );
+        txn.commit().await?;
+        assert_eq!(
+            allocation::load(&pool, allocation.allocation_id).await?,
+            Some(allocation)
+        );
+        let entry = find_value(&pool, &value.to_string()).await?.remove(0);
+        assert_eq!(
+            entry.state.0,
+            ResourcePoolEntryState::Allocated {
+                owner: "B".to_string(),
+                owner_type: OwnerType::Machine.to_string(),
+            }
+        );
+        assert_eq!(entry.allocated, Some(allocated));
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
+    async fn release_without_an_allocation_is_not_applied(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let resource_pool =
+            ResourcePool::new("no-allocation-release".to_string(), ValueType::Integer);
+        let mut txn = pool.begin().await?;
+        populate(&resource_pool, &mut txn, vec![1], true).await?;
+        txn.commit().await?;
+        check_cases_async(
+            [("already free", 1), ("missing", 2)].map(|(scenario, value)| Case {
+                scenario,
+                input: value,
+                expect: Yields(ConditionalWrite::NotApplied(ResourcePoolAllocationNotOwned)),
+            }),
+            |value| {
+                let pool = &pool;
+                let resource_pool = &resource_pool;
+                async move {
+                    let mut txn = pool.begin().await.expect("begin release transaction");
+                    let result = release(resource_pool, &mut txn, value, OwnerType::Machine, "A")
+                        .await
+                        .expect("release query succeeds");
+                    txn.commit().await.expect("commit release transaction");
+                    Ok::<_, ()>(result)
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            find_value(&pool, "1").await?[0].state.0,
+            ResourcePoolEntryState::Free
+        );
+        assert!(find_value(&pool, "2").await?.is_empty());
+        Ok(())
+    }
+
     // `capture_logs_async` wraps only `release`, whose await uses this
     // connection. No unrelated work runs while the connection is held.
     #[crate::sqlx_test]
@@ -1843,8 +2131,14 @@ mod tests {
             ResourcePool::<IpAddr>::new("release-test".to_string(), ValueType::Ipv4);
         let value: IpAddr = "192.0.2.10".parse()?;
         let metrics = MetricsCapture::start();
-        let (result, logs) =
-            capture_logs_async(release(&resource_pool, connection.as_mut(), value)).await;
+        let (result, logs) = capture_logs_async(release(
+            &resource_pool,
+            connection.as_mut(),
+            value,
+            OwnerType::Machine,
+            "test-owner",
+        ))
+        .await;
 
         let returned_error = result.expect_err("the renamed table must make release fail");
         assert!(
@@ -2022,6 +2316,63 @@ mod tests {
     }
 
     #[crate::sqlx_test]
+    async fn allocate_exact_preserves_assignment_partitions(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool_handle =
+            ResourcePool::<i32>::new("test-exact-pool".to_string(), ValueType::Integer);
+        for auto_assign in [true, false] {
+            let mut txn = pool.begin().await?;
+            populate(&pool_handle, &mut txn, vec![41, 42], auto_assign).await?;
+            let allocated =
+                allocate_exact(&pool_handle, &mut txn, OwnerType::Vpc, "owner", 42).await?;
+            assert_eq!(allocated, 42);
+
+            if auto_assign {
+                let result =
+                    allocate_exact(&pool_handle, &mut txn, OwnerType::Vpc, "owner", 42).await;
+                assert!(matches!(result, Err(DatabaseError::FailedPrecondition(_))));
+            }
+
+            let rows: Vec<(
+                i32,
+                sqlx::types::Json<ResourcePoolEntryState>,
+                Option<bool>,
+                bool,
+            )> = sqlx::query_as(
+                "SELECT value::integer, state, allocated = NOW(), auto_assign
+                     FROM resource_pool WHERE name = $1 ORDER BY value::integer",
+            )
+            .bind(pool_handle.name())
+            .fetch_all(&mut *txn)
+            .await?;
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        41,
+                        sqlx::types::Json(ResourcePoolEntryState::Free),
+                        None,
+                        auto_assign,
+                    ),
+                    (
+                        42,
+                        sqlx::types::Json(ResourcePoolEntryState::Allocated {
+                            owner: "owner".to_string(),
+                            owner_type: OwnerType::Vpc.to_string(),
+                        }),
+                        Some(true),
+                        auto_assign,
+                    ),
+                ],
+                "auto_assign={auto_assign}",
+            );
+            txn.rollback().await?;
+        }
+        Ok(())
+    }
+
+    #[crate::sqlx_test]
     async fn find_owned_allocation_returns_typed_value_and_rejects_duplicates(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2066,67 +2417,109 @@ mod tests {
         Ok(())
     }
 
-    /// Requesting a specific value that the pool cannot hand out — while the
-    /// pool still has free non-auto-assign entries — must map to
-    /// `FailedPrecondition`, distinct from the `Empty` (exhausted) case. The
-    /// pool is seeded non-empty on purpose so the asserted status code is what
-    /// callers observe regardless of the pre-scan being present or deferred.
+    /// Missing assignment modes remain distinct from unavailable requested values.
     #[crate::sqlx_test]
-    async fn allocate_requested_value_unavailable_is_failed_precondition(
+    async fn allocate_distinguishes_missing_ranges_from_unavailable_values(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use model::resource_pool::define::{Range, ResourcePoolDef, ResourcePoolType};
 
-        let mut txn = pool.begin().await?;
+        for (scenario, auto_assign, requested_value, missing_auto_assign) in [
+            ("value outside explicit range", false, Some(99), None),
+            ("value in automatic-only pool", true, Some(10), Some(false)),
+            (
+                "automatic allocation in explicit-only pool",
+                false,
+                None,
+                Some(true),
+            ),
+        ] {
+            let mut txn = pool.begin().await?;
+            define(
+                &mut txn,
+                "test-requested-unavail-pool",
+                &ResourcePoolDef {
+                    prefix: None,
+                    ranges: vec![Range {
+                        start: 10.to_string(),
+                        end: 13.to_string(),
+                        auto_assign,
+                    }],
+                    pool_type: ResourcePoolType::Integer,
+                    delegate_prefix_len: None,
+                },
+            )
+            .await?;
 
-        // A pool of non-auto-assign values 10, 11, 12 — so it has free
-        // non-auto-assign entries, but no auto-assign entries.
-        define(
-            &mut txn,
-            "test-requested-unavail-pool",
-            &ResourcePoolDef {
-                prefix: None,
-                ranges: vec![Range {
-                    start: 10.to_string(),
-                    end: 13.to_string(),
-                    auto_assign: false,
-                }],
-                pool_type: ResourcePoolType::Integer,
-                delegate_prefix_len: None,
-            },
-        )
-        .await
-        .unwrap();
+            let pool_handle = ResourcePool::<i64>::new(
+                "test-requested-unavail-pool".to_string(),
+                ValueType::Integer,
+            );
+            let err = allocate(
+                &pool_handle,
+                &mut txn,
+                OwnerType::Machine,
+                "owner",
+                requested_value,
+            )
+            .await
+            .expect_err("requesting an unavailable value must error");
 
-        let pool_handle = ResourcePool::<i64>::new(
-            "test-requested-unavail-pool".to_string(),
-            ValueType::Integer,
-        );
-
-        // 99 is not in the pool, so the request cannot be satisfied even though
-        // the pool is not exhausted (free non-auto-assign entries remain).
-        let err = allocate(
-            &pool_handle,
-            &mut txn,
-            OwnerType::Machine,
-            "owner",
-            Some(99),
-        )
-        .await
-        .expect_err("requesting an unavailable value must error");
-
-        match err {
-            ResourcePoolDatabaseError::Database(boxed) => {
-                assert!(
-                    matches!(*boxed, DatabaseError::FailedPrecondition(_)),
-                    "expected FailedPrecondition, got {boxed:?}"
-                );
+            match missing_auto_assign {
+                Some(expected_auto_assign) => {
+                    assert!(
+                        matches!(
+                            &err,
+                            ResourcePoolDatabaseError::ResourcePool(
+                                ResourcePoolError::MissingAllocationRange { pool_name, auto_assign }
+                            ) if pool_name == pool_handle.name() && *auto_assign == expected_auto_assign
+                        ),
+                        "{scenario}: expected missing range, got {err:?}"
+                    );
+                    assert!(!is_requested_value_unavailable(&err), "{scenario}");
+                }
+                None => {
+                    assert!(is_requested_value_unavailable(&err), "{scenario}: {err:?}");
+                }
             }
-            other => panic!("expected FailedPrecondition, got {other:?}"),
-        }
+            let status = tonic::Status::from(DatabaseError::from(err));
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{scenario}");
 
-        txn.rollback().await?;
+            txn.rollback().await?;
+        }
         Ok(())
+    }
+
+    #[test]
+    fn missing_range_classification_survives_database_wrapping() {
+        let missing_range = || ResourcePoolError::MissingAllocationRange {
+            pool_name: "test-pool".to_string(),
+            auto_assign: true,
+        };
+        for (scenario, error) in [
+            (
+                "pool error",
+                ResourcePoolDatabaseError::from(missing_range()),
+            ),
+            (
+                "database wrapper",
+                ResourcePoolDatabaseError::from(DatabaseError::from(missing_range())),
+            ),
+        ] {
+            assert_eq!(
+                classify_resource_pool_failure(&error),
+                ResourcePoolFailure::Configuration,
+                "{scenario}"
+            );
+            assert!(!is_requested_value_unavailable(&error), "{scenario}");
+            let status = tonic::Status::from(DatabaseError::from(error));
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{scenario}");
+            assert_eq!(
+                status.message(),
+                "resource-pool `test-pool` has no automatic allocation range",
+                "{scenario}"
+            );
+        }
     }
 
     /// Requesting a specific value from an EXHAUSTED non-auto-assign pool must
@@ -2196,6 +2589,11 @@ mod tests {
 
         txn.rollback().await?;
         Ok(())
+    }
+
+    #[test]
+    fn test_expand_int_range_uses_shared_hexadecimal_parser() {
+        assert_eq!(expand_int_range("0X10", "0x0x12").unwrap(), vec![16, 17]);
     }
 
     #[test]
@@ -2313,7 +2711,17 @@ mod tests {
         assert_eq!(pool_stats.free, 255);
 
         // Release the address.
-        release(&pool_handle, &mut txn, addr).await?;
+        assert_eq!(
+            release(
+                &pool_handle,
+                &mut txn,
+                addr,
+                OwnerType::Machine,
+                "test-owner"
+            )
+            .await?,
+            ConditionalWrite::Applied(())
+        );
         let pool_stats = stats(txn.as_mut(), "test-ipv6-pool").await?;
         assert_eq!(pool_stats.used, 0);
         assert_eq!(pool_stats.free, 256);
@@ -2499,6 +2907,24 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_ipv6_prefix_range_rejects_non_increasing_endpoints() {
+        value_scenarios!(run = |(start, end)| {
+            matches!(
+                expand_ipv6_prefix_range(start, end),
+                Err(DefineResourcePoolError::InvalidArgument(_))
+            )
+        };
+            "empty /0 range" {
+                ("::/0", "::/0") => true,
+            }
+
+            "reversed endpoints" {
+                ("fd00::300/120", "fd00::100/120") => true,
+            }
+        );
+    }
+
+    #[test]
     fn test_expand_ipv6_prefix_range_rejects_mismatched_len() {
         let result = expand_ipv6_prefix_range("fd00::/64", "fd00:1::/48");
         assert!(matches!(
@@ -2566,7 +2992,17 @@ mod tests {
         assert_eq!(pool_stats.free, 255);
 
         // Release the sub-prefix.
-        release(&pool_handle, &mut txn, prefix).await?;
+        assert_eq!(
+            release(
+                &pool_handle,
+                &mut txn,
+                prefix,
+                OwnerType::Machine,
+                "test-owner"
+            )
+            .await?,
+            ConditionalWrite::Applied(())
+        );
         let pool_stats = stats(txn.as_mut(), "test-ipv6prefix-pool").await?;
         assert_eq!(pool_stats.used, 0);
         assert_eq!(pool_stats.free, 256);

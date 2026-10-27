@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+use std::io::Write;
+
 use carbide_uuid::rack::RackId;
 use color_eyre::Result;
 use prettytable::{Table, row};
@@ -32,6 +34,7 @@ struct RackOutput {
     id: String,
     name: String,
     state: String,
+    certificate_failure: Option<model::component_manager::SwitchCertificateFailure>,
     version: String,
     current_compute_trays: Vec<String>,
     current_power_shelves: Vec<String>,
@@ -48,6 +51,11 @@ impl From<&Rack> for RackOutput {
                 .map(|m| m.name.clone())
                 .unwrap_or_default(),
             state: r.rack_state.clone(),
+            certificate_failure: r
+                .status
+                .as_ref()
+                .and_then(|status| status.lifecycle.as_ref())
+                .and_then(|lifecycle| super::super::certificate_failure(&lifecycle.state)),
             version: r.version.clone(),
             current_compute_trays: vec![],
             current_power_shelves: vec![],
@@ -132,7 +140,7 @@ pub(super) async fn show_rack(
             let racks = api_client.get_one_rack(rack_id).await?.racks;
             let outputs = get_rack_outputs(api_client, &racks).await?;
             match outputs.first() {
-                Some(output) => show_single(output, format)?,
+                Some(output) => show_single(output, format, &mut std::io::stdout())?,
                 None => println!("No rack found"),
             }
         }
@@ -142,7 +150,7 @@ pub(super) async fn show_rack(
                 println!("No racks found");
             } else {
                 let outputs = get_rack_outputs(api_client, &racks).await?;
-                show_list(&outputs, format)?;
+                show_list(&outputs, format, &mut std::io::stdout())?;
             }
         }
     }
@@ -150,32 +158,38 @@ pub(super) async fn show_rack(
     Ok(())
 }
 
-fn show_single(output: &RackOutput, format: OutputFormat) -> Result<()> {
+fn show_single(output: &RackOutput, format: OutputFormat, writer: &mut impl Write) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(output)?),
-        OutputFormat::Yaml => println!("{}", serde_yaml::to_string(output)?),
-        _ => show_detail(output),
+        OutputFormat::Json => writeln!(writer, "{}", serde_json::to_string_pretty(output)?)?,
+        OutputFormat::Yaml => writeln!(writer, "{}", serde_yaml::to_string(output)?)?,
+        _ => show_detail(output, writer)?,
     }
     Ok(())
 }
 
-fn show_list(outputs: &[RackOutput], format: OutputFormat) -> Result<()> {
+fn show_list(outputs: &[RackOutput], format: OutputFormat, writer: &mut impl Write) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(outputs)?),
-        OutputFormat::Yaml => println!("{}", serde_yaml::to_string(outputs)?),
-        OutputFormat::Csv => {
-            show_table_csv(outputs);
-        }
-        _ => show_table(outputs),
+        OutputFormat::Json => writeln!(writer, "{}", serde_json::to_string_pretty(outputs)?)?,
+        OutputFormat::Yaml => writeln!(writer, "{}", serde_yaml::to_string(outputs)?)?,
+        OutputFormat::Csv => show_table_csv(outputs, writer)?,
+        _ => show_table(outputs, writer)?,
     }
     Ok(())
 }
 
-fn show_detail(output: &RackOutput) {
+fn show_detail(output: &RackOutput, writer: &mut impl Write) -> Result<()> {
     let mut table = Table::new();
     table.add_row(row!["ID", output.id]);
     table.add_row(row!["Name", output.name]);
     table.add_row(row!["State", output.state]);
+    table.add_row(row![
+        "Certificate failure",
+        output
+            .certificate_failure
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    ]);
     table.add_row(row!["Version", output.version]);
     table.add_row(row![
         "Current Compute Trays",
@@ -216,10 +230,11 @@ fn show_detail(output: &RackOutput) {
                 .join("\n")
         }
     ]);
-    table.printstd();
+    table.print(writer)?;
+    Ok(())
 }
 
-fn show_table(outputs: &[RackOutput]) {
+fn show_table(outputs: &[RackOutput], writer: &mut impl Write) -> Result<()> {
     let mut table = Table::new();
     table.set_titles(row![
         "ID",
@@ -241,10 +256,11 @@ fn show_table(outputs: &[RackOutput]) {
         ]);
     }
 
-    table.printstd();
+    table.print(writer)?;
+    Ok(())
 }
 
-fn show_table_csv(outputs: &[RackOutput]) {
+fn show_table_csv(outputs: &[RackOutput], writer: &mut impl Write) -> Result<()> {
     let mut table = Table::new();
     table.set_titles(row![
         "ID",
@@ -266,7 +282,8 @@ fn show_table_csv(outputs: &[RackOutput]) {
         ]);
     }
 
-    table.to_csv(std::io::stdout()).ok();
+    table.to_csv(writer)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -305,6 +322,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             state: state.to_string(),
+            certificate_failure: None,
             version: version.to_string(),
             current_compute_trays: compute_trays.into_iter().map(str::to_string).collect(),
             current_power_shelves: power_shelves.into_iter().map(str::to_string).collect(),
@@ -435,7 +453,7 @@ mod tests {
                 input: || {
                     let output =
                         make_output("Rack1", "NVL72", "Created", "V1", vec![], vec![], vec![]);
-                    show_single(&output, OutputFormat::Json)
+                    show_single(&output, OutputFormat::Json, &mut Vec::new())
                 },
                 expect: Yields(()),
             },
@@ -444,7 +462,7 @@ mod tests {
                 input: || {
                     let output =
                         make_output("Rack1", "NVL72", "Created", "V1", vec![], vec![], vec![]);
-                    show_single(&output, OutputFormat::Yaml)
+                    show_single(&output, OutputFormat::Yaml, &mut Vec::new())
                 },
                 expect: Yields(()),
             },
@@ -463,7 +481,7 @@ mod tests {
                             vec![],
                         ),
                     ];
-                    show_list(&outputs, OutputFormat::Json)
+                    show_list(&outputs, OutputFormat::Json, &mut Vec::new())
                 },
                 expect: Yields(()),
             },
@@ -479,7 +497,7 @@ mod tests {
                         vec![],
                         vec![],
                     )];
-                    show_list(&outputs, OutputFormat::Yaml)
+                    show_list(&outputs, OutputFormat::Yaml, &mut Vec::new())
                 },
                 expect: Yields(()),
             },
@@ -487,16 +505,20 @@ mod tests {
         check_cases(cases, |run| run().map_err(drop));
     }
 
-    /// show_detail with all-empty component lists renders "N/A" paths without panicking.
+    /// show_detail with all-empty component lists renders "N/A" paths.
     #[test]
-    fn show_detail_with_empty_components_does_not_panic() {
+    fn show_detail_with_empty_components_renders_na() {
         let output = make_output("Rack1", "NVL72", "Created", "V1", vec![], vec![], vec![]);
-        show_detail(&output);
+        let mut rendered = Vec::new();
+        show_detail(&output, &mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+
+        assert_eq!(rendered.matches("N/A").count(), 3);
     }
 
-    /// show_detail with populated component lists renders join paths without panicking.
+    /// show_detail with populated component lists renders every component.
     #[test]
-    fn show_detail_with_populated_components_does_not_panic() {
+    fn show_detail_with_populated_components_renders_components() {
         let output = make_output(
             "Rack1",
             "NVL72",
@@ -506,12 +528,18 @@ mod tests {
             vec!["shelf-1"],
             vec!["switch-x"],
         );
-        show_detail(&output);
+        let mut rendered = Vec::new();
+        show_detail(&output, &mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+
+        for component in ["tray-a", "tray-b", "shelf-1", "switch-x"] {
+            assert!(rendered.contains(component), "missing {component}");
+        }
     }
 
-    /// show_table with multiple outputs does not panic.
+    /// show_table renders component counts for multiple outputs.
     #[test]
-    fn show_table_does_not_panic() {
+    fn show_table_renders_component_counts() {
         let outputs = vec![
             make_output(
                 "Rack1",
@@ -532,12 +560,17 @@ mod tests {
                 vec!["sw-1"],
             ),
         ];
-        show_table(&outputs);
+        let mut rendered = Vec::new();
+        show_table(&outputs, &mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+
+        assert!(rendered.contains("| Rack1 | NVL72 | Created     | 2"));
+        assert!(rendered.contains("| Rack2 | NVL36 | Provisioned | 0"));
     }
 
-    /// show_table_csv with multiple outputs does not panic.
+    /// show_table_csv renders headers and component counts.
     #[test]
-    fn show_table_csv_does_not_panic() {
+    fn show_table_csv_renders_component_counts() {
         let outputs = vec![make_output(
             "Rack1",
             "NVL72",
@@ -547,6 +580,11 @@ mod tests {
             vec![],
             vec![],
         )];
-        show_table_csv(&outputs);
+        let mut rendered = Vec::new();
+        show_table_csv(&outputs, &mut rendered).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+
+        assert!(rendered.contains("ID,Name,State,Compute Trays,Power Shelves,Switches"));
+        assert!(rendered.contains("Rack1,NVL72,Created,1,0,0"));
     }
 }

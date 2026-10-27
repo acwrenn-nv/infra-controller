@@ -22,15 +22,18 @@ driver = ["dep:clap", "dep:tracing-subscriber", "dep:libredfish"]
 
 [dependencies]
 hex = { workspace = true }
+indoc = { workspace = true }
 kube = { default-features = false, features = [
   "runtime",
   "derive",
   "client",
+  "jsonpatch",
   "rustls-tls",
   "aws-lc-rs",
 ], workspace = true }
 rustls = { workspace = true }
 k8s-openapi = { features = ["latest", "schemars"], workspace = true }
+json-patch = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -41,6 +44,7 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 uuid = { features = ["v4"], workspace = true }
 async-trait = { workspace = true }
+derive_builder = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }

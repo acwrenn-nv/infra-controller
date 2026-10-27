@@ -50,6 +50,8 @@ Org must have an Infrastructure Provider entity. User must have authorization ro
 
 Tenants cannot create Sites.
 
+New Sites enable `nativeNetworking`, `networkSecurityGroup`, and `flow` by default. Other Site capabilities default to `false`.
+
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
 	@return ApiCreateSiteRequest
@@ -812,6 +814,17 @@ func (a *SiteAPIService) GetSiteStatusHistoryExecute(r ApiGetSiteStatusHistoryRe
 			error: localVarHTTPResponse.Status,
 		}
 		if localVarHTTPResponse.StatusCode == 403 {
+			var v NICoAPIError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 404 {
 			var v NICoAPIError
 			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
 			if err != nil {

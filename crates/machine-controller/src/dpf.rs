@@ -18,26 +18,31 @@
 //! DPF SDK trait abstraction for testability.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use carbide_dpf::types::{
-    DetachedDpuServiceDefinition, DpuServiceObservation, DpuServiceVersion, HostDpfSnapshot,
-    ServiceTemplateVersion,
+    DetachedDpfResourceObservation, DetachedDpuServiceChainDefinition,
+    DetachedDpuServiceDefinition, DetachedDpuServiceInterfaceDefinition, DpfDeletePreconditions,
+    DpuServiceObservation, DpuServiceVersion, HostDpfSnapshot, ServiceTemplateVersion,
 };
 use carbide_dpf::{
-    BmcPasswordProvider, DPU_ENABLED_NODE_LABEL, DpfError, DpfSdk, DpuDeploymentType,
-    DpuDeviceInfo, DpuNodeInfo, DpuPhase, DpuWatcher, KubeRepository, ResourceLabeler,
-    node_id_from_dpu_node_cr_name,
+    AstraRoutePrefixes, BmcPasswordProvider, DPU_ENABLED_NODE_LABEL, DpfError, DpfSdk,
+    DpuDeploymentType, DpuDeviceInfo, DpuNodeInfo, DpuPhaseObservation, DpuWatcher, KubeRepository,
+    ResourceLabeler, node_id_from_dpu_node_cr_name,
 };
-use carbide_uuid::machine::MachineId;
-use model::dpa_interface::DpaInterface;
+use carbide_uuid::machine::{DpuMachineId, HostMachineId};
 use model::dpu_machine_update::OutdatedDpfDpu;
-use model::machine::{Machine, ManagedHostStateSnapshot};
+use model::expected_machine::ExpectedMachine;
+use model::machine::{DpuMachine, ManagedHostStateSnapshot};
 use model::machine_pending_action::{MachinePendingAction, MachinePendingActionKind};
 use sqlx::PgPool;
 use state_controller::controller::Enqueuer;
 use tokio::task::JoinSet;
+
+pub(crate) mod deployment;
+pub use deployment::validate_reprovision_compatibility;
 
 use crate::handler::is_bf4_dmi_product;
 use crate::io::MachineStateControllerIO;
@@ -50,7 +55,8 @@ const DPU_MACHINE_ID_LABEL: &str = "carbide.nvidia.com/dpu-machine-id";
 /// carbide-controlled. Propagates to the DPU CR.
 const CONTROLLED_DEVICE_LABEL: &str = "carbide.nvidia.com/controlled.device";
 
-/// Label populated with the host BMC address on both DPUDevice and DPUNode resources.
+/// Host BMC address on DPUDevice and DPUNode resources.
+/// IPv4 uses dotted decimal; IPv6 uses eight four-digit hexadecimal groups separated by hyphens.
 pub const HOST_BMC_IP_LABEL: &str = "carbide.nvidia.com/host-bmc-ip";
 
 /// Trait for DPF SDK operations used by Carbide.
@@ -62,11 +68,13 @@ pub const HOST_BMC_IP_LABEL: &str = "carbide.nvidia.com/host-bmc-ip";
 #[cfg_attr(feature = "test-support", mockall::automock)]
 #[async_trait]
 pub trait DpfOperations: Send + Sync + std::fmt::Debug {
-    /// Register a DPU device.
-    async fn register_dpu_device<'a>(
+    /// Register a DPU device using the full expected-machine entry when available.
+    /// The expected-machine entry contains credentials and must not be logged.
+    async fn register_dpu_device(
         &self,
         info: DpuDeviceInfo,
-        astra_nics: Option<Vec<&'a DpaInterface>>,
+        expected_machine: Option<ExpectedMachine>,
+        deployment_type: DpuDeploymentType,
     ) -> Result<(), DpfError>;
 
     /// Register a DPU node.
@@ -86,12 +94,43 @@ pub trait DpfOperations: Send + Sync + std::fmt::Debug {
         dpu_device_names: &[String],
     ) -> Result<(), DpfError>;
 
-    /// Get the current phase of a DPU (for status reporting).
-    async fn get_dpu_phase(
+    /// Read a DPU phase and terminal failure details from the same CR observation.
+    ///
+    /// `device_id` excludes the `device-` prefix. `node_name` accepts a node ID
+    /// or DPUNode CR name; one leading `node-` prefix is stripped. Deletion
+    /// returns `Deleting` without failure details, even with stale status.
+    /// See [`DpfSdk::get_dpu_phase_observation`] for errors when the CR or
+    /// status is missing.
+    async fn get_dpu_phase_observation(
         &self,
-        dpu_device_name: &str,
+        device_id: &str,
         node_name: &str,
-    ) -> Result<DpuPhase, DpfError>;
+    ) -> Result<DpuPhaseObservation, DpfError>;
+
+    /// Read every requested DPU phase and failure details only when one deployment owns the full
+    /// set and each `Ready` DPU matches its flavor and provisioning source.
+    ///
+    /// `device_ids` contains distinct IDs without the `device-` prefix; these
+    /// IDs are also the returned map keys, ordered lexicographically.
+    /// `node_name` accepts a node ID or DPUNode CR name; one leading `node-`
+    /// prefix is stripped. No partial map is returned. See
+    /// [`DpfSdk::get_dpu_phase_observations_for_deployment_type`] for `None`,
+    /// empty input, and error behavior.
+    async fn get_dpu_phase_observations_for_deployment_type(
+        &self,
+        device_ids: &[String],
+        node_name: &str,
+        deployment_type: DpuDeploymentType,
+    ) -> Result<Option<BTreeMap<String, DpuPhaseObservation>>, DpfError>;
+
+    /// Delete source deployment DPU CRs while preserving target replacements.
+    async fn delete_source_dpus_for_deployment_migration(
+        &self,
+        dpu_device_names: &[String],
+        node_name: &str,
+        source_deployment_type: DpuDeploymentType,
+        target_deployment_type: DpuDeploymentType,
+    ) -> Result<(), DpfError>;
 
     /// Check if a DPU node is waiting for external reboot.
     async fn is_reboot_required(&self, node_name: &str) -> Result<bool, DpfError>;
@@ -101,21 +140,33 @@ pub trait DpfOperations: Send + Sync + std::fmt::Debug {
 
     /// Resolve a DPU's base hardware deployment class (BF3 or BF4).
     ///
-    /// The state handler separately refines BF3 from the host rack and DPU
+    /// `deployment_types_for_host` refines BF3 from the host rack and DPU
     /// profile. This returns `Err` when the DMI product name is absent.
     fn deployment_type_for_dpu(
         &self,
-        dpu: &Machine,
+        dpu: &DpuMachine,
         astra_nics: bool,
     ) -> Result<DpuDeploymentType, DpfError>;
 
     /// Check that a DPUNode's labels match the current expected labels.
     /// Returns `false` when the node exists but has stale labels.
+    /// A missing DPUNode returns `true`; this does not establish resource readiness.
     async fn verify_node_labels(
         &self,
         node_name: &str,
         deployment_type: DpuDeploymentType,
     ) -> Result<bool, DpfError>;
+
+    /// Atomically moves a DPUNode from one deployment selector to another.
+    ///
+    /// A completed transfer does nothing, while a node matching neither selector
+    /// is rejected.
+    async fn transfer_dpu_node_deployment_labels(
+        &self,
+        node_name: &str,
+        source_deployment_type: DpuDeploymentType,
+        target_deployment_type: DpuDeploymentType,
+    ) -> Result<(), DpfError>;
 
     /// Curated snapshot of all DPF CRs related to one host (DPUNode +
     /// DPUDevices + DPUs). `node_name` is the full DPUNode CR name.
@@ -153,27 +204,95 @@ pub trait DpfOperations: Send + Sync + std::fmt::Debug {
     /// DPU is already up to date" fail closed.
     async fn is_dpu_outdated(&self, dpu_name: &str) -> Result<bool, DpfError>;
 
-    /// Create a direct, detached DPUService for an extension service.
+    /// Create a direct, detached DPUService managed independently of a DPUDeployment.
     async fn create_dpu_service(
         &self,
         service: &DetachedDpuServiceDefinition,
     ) -> Result<DpuServiceObservation, DpfError>;
 
-    /// Get any observed DPUService by name for an extension service.
+    /// Get any observed DPUService by name for ownership and convergence checks.
     async fn get_dpu_service(
         &self,
         service_name: &str,
     ) -> Result<Option<DpuServiceObservation>, DpfError>;
 
-    /// Merge-patch a detached DPUService for an extension service.
+    /// Apply an RFC 6902 JSON Patch to a detached DPUService.
     async fn patch_dpu_service(
         &self,
         service_name: &str,
         patch: serde_json::Value,
+    ) -> Result<DpuServiceObservation, DpfError>;
+
+    /// Delete the exact detached DPUService identified by Kubernetes preconditions.
+    async fn delete_dpu_service(
+        &self,
+        service_name: &str,
+        preconditions: &DpfDeletePreconditions,
     ) -> Result<(), DpfError>;
 
-    /// Delete a detached DPUService for an extension service.
-    async fn delete_dpu_service(&self, service_name: &str) -> Result<(), DpfError>;
+    /// List detached DPUServiceInterface parents, optionally restricted by a label selector.
+    async fn list_detached_dpu_service_interfaces<'a>(
+        &self,
+        label_selector: Option<&'a str>,
+    ) -> Result<Vec<DetachedDpfResourceObservation>, DpfError>;
+
+    /// Get one detached DPUServiceInterface parent by name.
+    async fn get_detached_dpu_service_interface(
+        &self,
+        name: &str,
+    ) -> Result<Option<DetachedDpfResourceObservation>, DpfError>;
+
+    /// Create one detached DPUServiceInterface registration parent.
+    async fn create_detached_dpu_service_interface(
+        &self,
+        definition: &DetachedDpuServiceInterfaceDefinition,
+    ) -> Result<DetachedDpfResourceObservation, DpfError>;
+
+    /// Apply a revision-fenced JSON Patch to one detached DPUServiceInterface.
+    async fn patch_detached_dpu_service_interface(
+        &self,
+        name: &str,
+        patch: serde_json::Value,
+    ) -> Result<DetachedDpfResourceObservation, DpfError>;
+
+    /// Delete the exact detached DPUServiceInterface registration parent observed.
+    async fn delete_detached_dpu_service_interface(
+        &self,
+        name: &str,
+        preconditions: &DpfDeletePreconditions,
+    ) -> Result<(), DpfError>;
+
+    /// List detached DPUServiceChain parents, optionally restricted by a label selector.
+    async fn list_detached_dpu_service_chains<'a>(
+        &self,
+        label_selector: Option<&'a str>,
+    ) -> Result<Vec<DetachedDpfResourceObservation>, DpfError>;
+
+    /// Get one detached DPUServiceChain parent by name.
+    async fn get_detached_dpu_service_chain(
+        &self,
+        name: &str,
+    ) -> Result<Option<DetachedDpfResourceObservation>, DpfError>;
+
+    /// Create one detached DPUServiceChain registration parent.
+    async fn create_detached_dpu_service_chain(
+        &self,
+        definition: &DetachedDpuServiceChainDefinition,
+    ) -> Result<DetachedDpfResourceObservation, DpfError>;
+
+    /// Apply a revision-fenced JSON Patch to one detached DPUServiceChain.
+    async fn patch_detached_dpu_service_chain(
+        &self,
+        name: &str,
+        patch: serde_json::Value,
+    ) -> Result<DetachedDpfResourceObservation, DpfError>;
+
+    /// Delete the exact detached DPUServiceChain registration parent observed.
+    async fn delete_detached_dpu_service_chain(
+        &self,
+        name: &str,
+        preconditions: &DpfDeletePreconditions,
+    ) -> Result<(), DpfError>;
 
     /// Merge changes into a DPUDevice's DPU-cluster node labels.
     async fn merge_dpu_device_node_labels(
@@ -271,7 +390,10 @@ impl ResourceLabeler for CarbideDPFLabeler {
     fn device_labels(&self, info: &DpuDeviceInfo) -> BTreeMap<String, String> {
         BTreeMap::from([
             (CONTROLLED_DEVICE_LABEL.to_string(), "true".to_string()),
-            (HOST_BMC_IP_LABEL.to_string(), info.host_bmc_ip.to_string()),
+            (
+                HOST_BMC_IP_LABEL.to_string(),
+                host_bmc_ip_label_value(info.host_bmc_ip),
+            ),
             (
                 "carbide.nvidia.com/is-primary-dpu".to_string(),
                 info.is_primary.to_string(),
@@ -305,11 +427,25 @@ impl ResourceLabeler for CarbideDPFLabeler {
     }
 
     fn node_context_labels(&self, info: &DpuNodeInfo) -> BTreeMap<String, String> {
-        BTreeMap::from([(HOST_BMC_IP_LABEL.to_string(), info.host_bmc_ip.to_string())])
+        BTreeMap::from([(
+            HOST_BMC_IP_LABEL.to_string(),
+            host_bmc_ip_label_value(info.host_bmc_ip),
+        )])
     }
 
     fn dpu_label_selector(&self) -> Option<String> {
         Some(format!("{CONTROLLED_DEVICE_LABEL}=true"))
+    }
+}
+
+fn host_bmc_ip_label_value(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        // Kubernetes labels cannot contain colons or start/end with a hyphen.
+        IpAddr::V6(ip) => ip
+            .segments()
+            .map(|segment| format!("{segment:04x}"))
+            .join("-"),
     }
 }
 
@@ -324,16 +460,19 @@ impl ResourceLabeler for CarbideDPFLabeler {
 pub struct CarbideBmcPasswordProvider {
     credential_reader: Arc<dyn carbide_secrets::credentials::CredentialReader>,
     db_pool: sqlx::PgPool,
+    local_v0_authoritative: bool,
 }
 
 impl CarbideBmcPasswordProvider {
     pub fn new(
         credential_reader: Arc<dyn carbide_secrets::credentials::CredentialReader>,
         db_pool: sqlx::PgPool,
+        local_v0_authoritative: bool,
     ) -> Self {
         Self {
             credential_reader,
             db_pool,
+            local_v0_authoritative,
         }
     }
 
@@ -376,19 +515,85 @@ impl CarbideBmcPasswordProvider {
     }
 }
 
+fn require_nonempty_bmc_password(
+    password: String,
+    local_v0_authoritative: bool,
+) -> Result<String, DpfError> {
+    if password.is_empty() {
+        let message = "site-wide BMC root credential is empty".to_string();
+        if local_v0_authoritative {
+            Err(DpfError::LocalBmcPasswordSourceUnavailable(message))
+        } else {
+            Err(DpfError::BmcPasswordSourceUnavailable(message))
+        }
+    } else {
+        Ok(password)
+    }
+}
+
+async fn classify_unresolved_rotation_target(
+    credential_reader: &dyn carbide_secrets::credentials::CredentialReader,
+    error: DpfError,
+    local_v0_authoritative: bool,
+) -> DpfError {
+    use carbide_secrets::credentials::{BmcCredentialType, CredentialKey, Credentials};
+
+    if !local_v0_authoritative {
+        return error;
+    }
+
+    let v0_key = CredentialKey::BmcCredentials {
+        credential_type: BmcCredentialType::SiteWideRoot,
+    };
+    match credential_reader.get_credentials(&v0_key).await {
+        Ok(Some(Credentials::UsernamePassword { password, .. })) if !password.is_empty() => error,
+        Ok(_) | Err(carbide_secrets::SecretsError::BmcSiteWideRootV0CredentialReadBlocked) => {
+            DpfError::LocalBmcPasswordSourceUnavailable(format!(
+                "cannot resolve the current site-wide BMC root and authoritative local version 0 is unavailable: {error}"
+            ))
+        }
+        Err(source_error) => DpfError::LocalBmcPasswordSourceUnavailable(format!(
+            "cannot resolve the current site-wide BMC root or verify authoritative local version 0: rotation target error: {error}; local source error: {source_error}"
+        )),
+    }
+}
+
 #[async_trait]
 impl BmcPasswordProvider for CarbideBmcPasswordProvider {
     async fn get_bmc_password(&self) -> Result<String, DpfError> {
         use carbide_secrets::credentials::{BmcCredentialType, CredentialKey, Credentials};
-        let version = self.current_sitewide_bmc_version().await?;
+        let version = match self.current_sitewide_bmc_version().await {
+            Ok(version) => version,
+            Err(error) => {
+                return Err(classify_unresolved_rotation_target(
+                    self.credential_reader.as_ref(),
+                    error,
+                    self.local_v0_authoritative,
+                )
+                .await);
+            }
+        };
         let key = CredentialKey::BmcCredentials {
             credential_type: BmcCredentialType::site_wide_root(version),
         };
         match self.credential_reader.get_credentials(&key).await {
-            Ok(Some(Credentials::UsernamePassword { password, .. })) => Ok(password),
-            Ok(_) => Err(DpfError::InvalidState(
-                "Site wide BMC root credentials not set".into(),
+            Ok(Some(Credentials::UsernamePassword { password, .. })) => {
+                require_nonempty_bmc_password(password, version == 0 && self.local_v0_authoritative)
+            }
+            Ok(None) => Err(DpfError::BmcPasswordSourceUnavailable(
+                "site-wide BMC root credential is not available from the configured sources"
+                    .to_string(),
             )),
+            Err(carbide_secrets::SecretsError::BmcSiteWideRootV0CredentialReadBlocked) => {
+                Err(DpfError::LocalBmcPasswordSourceUnavailable(
+                    "local site-wide BMC root version 0 is not available".to_string(),
+                ))
+            }
+            Err(error) if version == 0 && self.local_v0_authoritative => {
+                Err(DpfError::LocalBmcPasswordSourceUnavailable(format!(
+                    "failed to read authoritative local site-wide BMC root version 0: {error}"
+                )))
+            }
             Err(e) => Err(DpfError::InvalidState(format!(
                 "Failed to read BMC credentials: {e}"
             ))),
@@ -400,12 +605,14 @@ impl BmcPasswordProvider for CarbideBmcPasswordProvider {
 pub struct DpfSdkOps {
     sdk: Arc<DpfSdk<KubeRepository, CarbideDPFLabeler>>,
     _watcher: DpuWatcher,
+    astra_route_prefixes: AstraRoutePrefixes,
 }
 
 impl DpfSdkOps {
     /// Create a new DpfSdkOps using the DPF SDK and sets up watcher callbacks to trigger carbide state handling.
     pub fn new(
         sdk: Arc<DpfSdk<KubeRepository, CarbideDPFLabeler>>,
+        astra_route_prefixes: AstraRoutePrefixes,
         db_pool: PgPool,
         join_set: &mut JoinSet<()>,
     ) -> std::io::Result<Self> {
@@ -492,6 +699,7 @@ impl DpfSdkOps {
         Ok(Self {
             sdk,
             _watcher: watcher,
+            astra_route_prefixes,
         })
     }
 }
@@ -499,7 +707,7 @@ impl DpfSdkOps {
 /// Records that a host owes `kind`, returning the stored action.
 async fn record_pending_action(
     db_pool: &PgPool,
-    host_machine_id: &MachineId,
+    host_machine_id: &HostMachineId,
     kind: MachinePendingActionKind,
 ) -> Result<MachinePendingAction, DpfError> {
     let mut conn = db_pool.acquire().await.map_err(|e| {
@@ -538,7 +746,7 @@ async fn enqueue_host(
         let mut conn = db_pool.acquire().await.map_err(|e| {
             DpfError::InvalidState(format!("Failed to acquire database connection: {e}"))
         })?;
-        db::machine_topology::find_machine_id_by_bmc_mac(&mut conn, bmc_mac)
+        db::machine_topology::find_machine_id_by_bmc_mac::<HostMachineId>(&mut conn, bmc_mac)
             .await
             .map_err(|e| {
                 DpfError::InvalidState(format!("DB error looking up host by BMC MAC: {e}"))
@@ -606,12 +814,21 @@ impl std::fmt::Debug for DpfSdkOps {
 /// Delegates everything to the underlying DPF SDK.
 #[async_trait]
 impl DpfOperations for DpfSdkOps {
-    async fn register_dpu_device<'a>(
+    async fn register_dpu_device(
         &self,
         info: DpuDeviceInfo,
-        astra_nics: Option<Vec<&'a DpaInterface>>,
+        expected_machine: Option<ExpectedMachine>,
+        deployment_type: DpuDeploymentType,
     ) -> Result<(), DpfError> {
-        self.sdk.register_dpu_device(info, astra_nics).await
+        // For BF4 Astra, pair the expected-machine entry with site-configured route
+        // prefixes. The SDK uses this to build the values passed to the dpudevice.
+        let astra_provisioning_inputs = expected_machine
+            .as_ref()
+            .filter(|_| deployment_type == DpuDeploymentType::Bf4Astra)
+            .map(|machine| (machine, self.astra_route_prefixes));
+        self.sdk
+            .register_dpu_device(info, astra_provisioning_inputs)
+            .await
     }
 
     async fn register_dpu_node(&self, info: DpuNodeInfo) -> Result<(), DpfError> {
@@ -638,12 +855,42 @@ impl DpfOperations for DpfSdkOps {
         self.sdk.reprovision_dpu(dpu_device_name, node_name).await
     }
 
-    async fn get_dpu_phase(
+    async fn get_dpu_phase_observation(
         &self,
-        dpu_device_name: &str,
+        device_id: &str,
         node_name: &str,
-    ) -> Result<DpuPhase, DpfError> {
-        self.sdk.get_dpu_phase(dpu_device_name, node_name).await
+    ) -> Result<DpuPhaseObservation, DpfError> {
+        self.sdk
+            .get_dpu_phase_observation(device_id, node_name)
+            .await
+    }
+
+    async fn get_dpu_phase_observations_for_deployment_type(
+        &self,
+        device_ids: &[String],
+        node_name: &str,
+        deployment_type: DpuDeploymentType,
+    ) -> Result<Option<BTreeMap<String, DpuPhaseObservation>>, DpfError> {
+        self.sdk
+            .get_dpu_phase_observations_for_deployment_type(device_ids, node_name, deployment_type)
+            .await
+    }
+
+    async fn delete_source_dpus_for_deployment_migration(
+        &self,
+        dpu_device_names: &[String],
+        node_name: &str,
+        source_deployment_type: DpuDeploymentType,
+        target_deployment_type: DpuDeploymentType,
+    ) -> Result<(), DpfError> {
+        self.sdk
+            .delete_source_dpus_for_deployment_migration(
+                dpu_device_names,
+                node_name,
+                source_deployment_type,
+                target_deployment_type,
+            )
+            .await
     }
 
     async fn is_reboot_required(&self, node_name: &str) -> Result<bool, DpfError> {
@@ -656,7 +903,7 @@ impl DpfOperations for DpfSdkOps {
 
     fn deployment_type_for_dpu(
         &self,
-        dpu: &Machine,
+        dpu: &DpuMachine,
         astra_nics: bool,
     ) -> Result<DpuDeploymentType, DpfError> {
         let product_name = dpu
@@ -706,6 +953,21 @@ impl DpfOperations for DpfSdkOps {
             .await
     }
 
+    async fn transfer_dpu_node_deployment_labels(
+        &self,
+        node_name: &str,
+        source_deployment_type: DpuDeploymentType,
+        target_deployment_type: DpuDeploymentType,
+    ) -> Result<(), DpfError> {
+        self.sdk
+            .transfer_dpu_node_deployment_labels(
+                node_name,
+                source_deployment_type,
+                target_deployment_type,
+            )
+            .await
+    }
+
     async fn snapshot_host(&self, node_name: &str) -> Result<HostDpfSnapshot, DpfError> {
         self.sdk.snapshot_host(node_name).await
     }
@@ -744,7 +1006,7 @@ impl DpfOperations for DpfSdkOps {
                 );
                 continue;
             };
-            let dpu_machine_id: MachineId = match machine_id_str.parse() {
+            let dpu_machine_id: DpuMachineId = match machine_id_str.parse() {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(
@@ -783,12 +1045,104 @@ impl DpfOperations for DpfSdkOps {
         &self,
         service_name: &str,
         patch: serde_json::Value,
-    ) -> Result<(), DpfError> {
+    ) -> Result<DpuServiceObservation, DpfError> {
         self.sdk.patch_dpu_service(service_name, patch).await
     }
 
-    async fn delete_dpu_service(&self, service_name: &str) -> Result<(), DpfError> {
-        self.sdk.delete_dpu_service(service_name).await
+    async fn delete_dpu_service(
+        &self,
+        service_name: &str,
+        preconditions: &DpfDeletePreconditions,
+    ) -> Result<(), DpfError> {
+        self.sdk
+            .delete_dpu_service(service_name, preconditions)
+            .await
+    }
+
+    async fn list_detached_dpu_service_interfaces<'a>(
+        &self,
+        label_selector: Option<&'a str>,
+    ) -> Result<Vec<DetachedDpfResourceObservation>, DpfError> {
+        self.sdk
+            .list_detached_dpu_service_interfaces(label_selector)
+            .await
+    }
+
+    async fn get_detached_dpu_service_interface(
+        &self,
+        name: &str,
+    ) -> Result<Option<DetachedDpfResourceObservation>, DpfError> {
+        self.sdk.get_detached_dpu_service_interface(name).await
+    }
+
+    async fn create_detached_dpu_service_interface(
+        &self,
+        definition: &DetachedDpuServiceInterfaceDefinition,
+    ) -> Result<DetachedDpfResourceObservation, DpfError> {
+        self.sdk
+            .create_detached_dpu_service_interface(definition)
+            .await
+    }
+
+    async fn patch_detached_dpu_service_interface(
+        &self,
+        name: &str,
+        patch: serde_json::Value,
+    ) -> Result<DetachedDpfResourceObservation, DpfError> {
+        self.sdk
+            .patch_detached_dpu_service_interface(name, patch)
+            .await
+    }
+
+    async fn delete_detached_dpu_service_interface(
+        &self,
+        name: &str,
+        preconditions: &DpfDeletePreconditions,
+    ) -> Result<(), DpfError> {
+        self.sdk
+            .delete_detached_dpu_service_interface(name, preconditions)
+            .await
+    }
+
+    async fn list_detached_dpu_service_chains<'a>(
+        &self,
+        label_selector: Option<&'a str>,
+    ) -> Result<Vec<DetachedDpfResourceObservation>, DpfError> {
+        self.sdk
+            .list_detached_dpu_service_chains(label_selector)
+            .await
+    }
+
+    async fn get_detached_dpu_service_chain(
+        &self,
+        name: &str,
+    ) -> Result<Option<DetachedDpfResourceObservation>, DpfError> {
+        self.sdk.get_detached_dpu_service_chain(name).await
+    }
+
+    async fn create_detached_dpu_service_chain(
+        &self,
+        definition: &DetachedDpuServiceChainDefinition,
+    ) -> Result<DetachedDpfResourceObservation, DpfError> {
+        self.sdk.create_detached_dpu_service_chain(definition).await
+    }
+
+    async fn patch_detached_dpu_service_chain(
+        &self,
+        name: &str,
+        patch: serde_json::Value,
+    ) -> Result<DetachedDpfResourceObservation, DpfError> {
+        self.sdk.patch_detached_dpu_service_chain(name, patch).await
+    }
+
+    async fn delete_detached_dpu_service_chain(
+        &self,
+        name: &str,
+        preconditions: &DpfDeletePreconditions,
+    ) -> Result<(), DpfError> {
+        self.sdk
+            .delete_detached_dpu_service_chain(name, preconditions)
+            .await
     }
 
     async fn merge_dpu_device_node_labels(
@@ -806,5 +1160,95 @@ impl DpfOperations for DpfSdkOps {
         dpu_device_name: &str,
     ) -> Result<BTreeMap<String, String>, DpfError> {
         self.sdk.get_dpu_device_node_labels(dpu_device_name).await
+    }
+}
+
+#[cfg(test)]
+mod bmc_password_tests {
+    use carbide_secrets::MemoryCredentialStore;
+    use carbide_secrets::credentials::{CredentialKey, CredentialWriter, Credentials};
+
+    use super::*;
+
+    #[test]
+    fn empty_password_preserves_local_v0_source_policy() {
+        assert!(matches!(
+            require_nonempty_bmc_password(String::new(), true),
+            Err(DpfError::LocalBmcPasswordSourceUnavailable(_))
+        ));
+        assert!(matches!(
+            require_nonempty_bmc_password(String::new(), false),
+            Err(DpfError::BmcPasswordSourceUnavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unresolved_target_fails_closed_only_when_local_v0_is_unavailable() {
+        let store = MemoryCredentialStore::default();
+        let error = DpfError::InvalidState("rotation table unavailable".to_string());
+        assert!(matches!(
+            classify_unresolved_rotation_target(&store, error, true).await,
+            DpfError::LocalBmcPasswordSourceUnavailable(_)
+        ));
+
+        let key = CredentialKey::BmcCredentials {
+            credential_type: carbide_secrets::credentials::BmcCredentialType::SiteWideRoot,
+        };
+        store
+            .set_credentials(&key, &Credentials::new("root", "local-password"))
+            .await
+            .expect("seed local v0");
+        let error = DpfError::InvalidState("rotation table unavailable".to_string());
+        assert!(matches!(
+            classify_unresolved_rotation_target(&store, error, true).await,
+            DpfError::InvalidState(_)
+        ));
+
+        let empty_store = MemoryCredentialStore::default();
+        let error = DpfError::InvalidState("rotation table unavailable".to_string());
+        assert!(matches!(
+            classify_unresolved_rotation_target(&empty_store, error, false).await,
+            DpfError::InvalidState(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn host_bmc_ip_labels_preserve_ipv4_and_encode_ipv6() {
+        let labeler = CarbideDPFLabeler::new("test/deployment".to_string());
+        for (address, expected) in [
+            ("192.0.2.10", "192.0.2.10"),
+            ("::1", "0000-0000-0000-0000-0000-0000-0000-0001"),
+            ("2001:db8::", "2001-0db8-0000-0000-0000-0000-0000-0000"),
+        ] {
+            let host_bmc_ip = address.parse().unwrap();
+            let device = DpuDeviceInfo {
+                device_id: "device-1".to_string(),
+                dpu_bmc_ip: "192.0.2.20".parse().unwrap(),
+                host_bmc_ip,
+                serial_number: "SN1".to_string(),
+                dpu_machine_id: "machine-1".to_string(),
+                is_primary: true,
+            };
+            let node = DpuNodeInfo {
+                node_id: "node-1".to_string(),
+                host_bmc_ip,
+                device_ids: vec![device.device_id.clone()],
+                deployment_type: DpuDeploymentType::Bf3,
+            };
+            assert_eq!(labeler.device_labels(&device)[HOST_BMC_IP_LABEL], expected);
+            assert_eq!(
+                labeler.node_context_labels(&node)[HOST_BMC_IP_LABEL],
+                expected
+            );
+            assert_eq!(
+                expected.replace('-', ":").parse::<IpAddr>().unwrap(),
+                host_bmc_ip
+            );
+        }
     }
 }

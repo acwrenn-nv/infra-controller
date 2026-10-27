@@ -40,10 +40,62 @@ forge_test_pass=
 update_grub_template="yes"
 update_grub_cfg="yes"
 
+# Downloads the complete request URL to one caller-visible local filename while
+# preserving each forwarded curl argument as a separate value.
 function curl_url() {
 	url=$1
-	auth=$2
-	curl --retry 5 --retry-all-errors -k -L -O $auth $url 2>&1 | tee $log_output
+	shift
+	# Keep a distro-selected checksum filename; otherwise use only the
+	# explicit URL path so query parameters cannot change the local name.
+	if [ -z "$file" ]; then
+		file=$(basename "${url%%\?*}")
+	fi
+	curl --retry 5 --retry-all-errors -k -L "$@" \
+		--output "$file" "$url" 2>&1 | tee "$log_output"
+}
+
+# Announces the download without exposing URL queries, which may contain
+# credentials, to stdout or the imaging log.
+function announce_image_download() {
+	echo "Downloading image" | tee "$log_output"
+}
+
+# build_image_auth_args populates the image_auth array with the curl arguments
+# needed to authenticate the image download, or leaves it empty when
+# image_auth_token is unset. Kept as an array, not a string, so the header
+# value survives as a single argument instead of being word-split.
+#
+# The header is written to a 0600 temporary file and passed via curl's -K
+# config-file flag, rather than -H on the command line, so the token does not
+# appear in this process's argument list (visible to other local processes
+# through /proc/<pid>/cmdline or ps). image_auth_header_file is left set so
+# the caller can remove it once the download is done.
+function build_image_auth_args() {
+	image_auth=()
+	image_auth_header_file=
+	if [ -n "$image_auth_token" ]; then
+		if [ -z "$image_auth_type" ]; then
+			image_auth_type=Bearer
+		fi
+
+		# Escape curl's quoted config-value syntax (backslash first, so the
+		# backslash this introduces for a literal quote is not itself
+		# re-escaped).
+		escaped_type=${image_auth_type//\\/\\\\}
+		escaped_type=${escaped_type//\"/\\\"}
+		escaped_token=${image_auth_token//\\/\\\\}
+		escaped_token=${escaped_token//\"/\\\"}
+
+		image_auth_header_file=$(mktemp) || return 1
+		if ! chmod 600 "$image_auth_header_file" ||
+			! printf 'header = "Authorization: %s %s"\n' "$escaped_type" "$escaped_token" \
+				>"$image_auth_header_file"; then
+			rm -f "$image_auth_header_file"
+			image_auth_header_file=
+			return 1
+		fi
+		image_auth=(-K "$image_auth_header_file")
+	fi
 }
 
 function verify_sha() {
@@ -96,11 +148,7 @@ function find_bootdisk() {
 	else
 		image_disk=$(find_efi_disk $disk_names)
 		if [ -z "$image_disk" ]; then
-			if [ -b /dev/nvme0n1 ]; then
-				image_disk="/dev/nvme0n1"
-			elif [ -b /dev/sda ]; then
-				image_disk="/dev/sda"
-			fi
+			image_disk=$(echo "$disk_names" | grep -E '^/dev/(nvme[0-9]+n[0-9]+|[sv]d[a-z]+)$' | head -n 1)
 		fi
 	fi
 
@@ -250,7 +298,7 @@ function find_devices_by_identifier() {
 	local blkid_stderr_file
 
 	case "$identifier_type" in
-		UUID|LABEL)
+		UUID|LABEL|PARTUUID|PARTLABEL)
 			;;
 		*)
 			echo "Unsupported block device identifier type: $identifier_type" | tee "$log_output" >&2
@@ -437,30 +485,114 @@ function get_serial_port() {
 	echo "Using serial port: [$serial_port] ($serial_port_num)" | tee $log_output
 }
 
+function partition_on_disk() {
+	local disk=$1
+	local number=$2
+
+	case "$disk" in
+		*[0-9])
+			echo "$disk"p"$number"
+			;;
+		*)
+			echo "$disk$number"
+			;;
+	esac
+}
+
+function resolve_fstab_mount_device() {
+	local mountpoint=$1
+	local disk=$2
+	local fstab=$3
+	local spec
+	local identifier_type
+	local identifier
+
+	if [ ! -f "$fstab" ]; then
+		return 2
+	fi
+	spec=$(awk '$1 !~ /^#/ && NF >= 2 { mp = $2; if (length(mp) > 1) { sub(/\/+$/, "", mp) }; if (mp == mountpoint) { print $1; exit } }' mountpoint="$mountpoint" "$fstab")
+	if [ -z "$spec" ]; then
+		return 2
+	fi
+	case "$spec" in
+		UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*)
+			identifier_type=${spec%%=*}
+			identifier=$(printf '%b' "${spec#*=}")
+			;;
+		*)
+			echo "$fstab names $mountpoint by [$spec], which cannot be resolved on $disk; only UUID=, LABEL=, PARTUUID= and PARTLABEL= sources are supported, set bootfs_uuid to select the partition explicitly" | tee "$log_output" >&2
+			return 3
+			;;
+	esac
+	resolve_device_on_disk "$identifier_type" "$identifier" "$disk"
+}
+
+function resolve_boot_partition() {
+	local fstab=${1:-/mnt/etc/fstab}
+	local fstab_status
+	local fstab_spec
+
+	boot_part=
+	boot_part_source=
+	if [ ! -z "$bootfs_uuid" ]; then
+		boot_part=$(resolve_device_on_disk UUID "$bootfs_uuid" "$image_disk") || return 1
+		boot_part_source=override
+		echo "Resolved /boot from bootfs_uuid=$bootfs_uuid to $boot_part" | tee "$log_output"
+		return 0
+	fi
+
+	fstab_spec=$(resolve_fstab_mount_device /boot "$image_disk" "$fstab")
+	fstab_status=$?
+	case "$fstab_status" in
+		0)
+			boot_part=$fstab_spec
+			boot_part_source=fstab
+			echo "Resolved /boot from $fstab to $boot_part" | tee "$log_output"
+			return 0
+			;;
+		2)
+			if [ -f "$fstab" ]; then
+				echo "$fstab has no /boot entry; /boot stays on the root filesystem" | tee "$log_output"
+				return 0
+			fi
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	boot_part=$(partition_on_disk "$image_disk" 1)
+	if [ "$boot_part" == "$root_dev" ]; then
+		echo "No $fstab in the image and $boot_part is the root filesystem; /boot stays on it" | tee "$log_output"
+		boot_part=
+		return 0
+	fi
+	boot_part_source=default
+	echo "No $fstab in the image; defaulting /boot to $boot_part" | tee "$log_output"
+	return 0
+}
+
 function modify_grub_cfg() {
 	local efi_status
 	local grub_cfg_status
 
 	efi_mounted=
 	if [ ! -d "/mnt/boot/grub" ]; then
-		boot_part=
-		if [ ! -z "$bootfs_uuid" ]; then
-			boot_part=$(resolve_device_on_disk UUID "$bootfs_uuid" "$image_disk") || return 1
-		fi
-		is_nvme=$(echo $image_disk | grep nvme)
-		if [ -z "$boot_part" ]; then
-			if [ ! -z "$is_nvme" ]; then
-				boot_part="$image_disk"p1
-			else
-				boot_part="$image_disk"1
-			fi
+		if ! resolve_boot_partition; then
+			return 1
 		fi
 
-		if [ ! -b "$boot_part" ]; then
-			# This is not error, as CentOS, for example, does not have dedicated /boot partition
-			echo "Boot partition $boot_part not found or is not a block device" | tee $log_output
-		else
-			mount "$boot_part" /mnt/boot
+		if [ ! -z "$boot_part" ]; then
+			if [ ! -b "$boot_part" ]; then
+				# This is not error, as CentOS, for example, does not have dedicated /boot partition
+				echo "Boot partition $boot_part not found or is not a block device" | tee $log_output
+			else
+				mount "$boot_part" /mnt/boot 2>&1 | tee "$log_output"
+				if [ "${PIPESTATUS[0]}" -ne 0 ] && [ "$boot_part_source" != "default" ]; then
+					echo "Failed to mount $boot_part on /mnt/boot" | tee "$log_output" >&2
+					return 1
+				fi
+			fi
 		fi
 		# we want to mount efi now as it can contain uefi grub.cfg
 		if ! mount_efi; then
@@ -482,7 +614,10 @@ function modify_grub_cfg() {
 		fi
 		if [ -z "$grub_cfg" ]; then
 			echo "grub.cfg not found" | tee $log_output
-			umount /mnt/boot
+			umount /mnt/boot/efi 2>&1 | tee "$log_output"
+			if mountpoint -q /mnt/boot; then
+				umount /mnt/boot 2>&1 | tee "$log_output"
+			fi
 			return 0
 		fi
 	fi
@@ -959,6 +1094,69 @@ function modify_grub_template() {
 	cat $new_grub_template > /mnt/etc/default/grub
 }
 
+function parse_kernel_cmdline_argument() {
+	local argument=$1
+
+	case "$argument" in
+		image_url=*)
+			image_url=${argument#image_url=}
+			;;
+		image_sha=*)
+			image_sha=${argument#image_sha=}
+			;;
+		image_auth_type=*)
+			image_auth_type=${argument#image_auth_type=}
+			;;
+		image_auth_token=*)
+			image_auth_token=${argument#image_auth_token=}
+			;;
+		image_disk=*)
+			image_disk=${argument#image_disk=}
+			;;
+		image_distro_name=*)
+			distro_name=${argument#image_distro_name=}
+			distro_name=${distro_name,,}
+			;;
+		image_distro_version=*)
+			distro_version=${argument#image_distro_version=}
+			;;
+		image_distro_release=*)
+			distro_release=${argument#image_distro_release=}
+			;;
+		"ds=nocloud;s="*|"ds=nocloud-net;s="*)
+			cloud_init_url=${argument#*;s=}
+			;;
+		create_forge_test_user=*)
+			user_pass=${argument#create_forge_test_user=}
+			forge_test_user=${user_pass%%:*}
+			forge_test_pass=${user_pass#*:}
+			;;
+		rootfs_uuid=*)
+			rootfs_uuid=${argument#rootfs_uuid=}
+			;;
+		rootfs_label=*)
+			rootfs_label=${argument#rootfs_label=}
+			;;
+		bootfs_uuid=*)
+			bootfs_uuid=${argument#bootfs_uuid=}
+			;;
+		efifs_uuid=*)
+			efifs_uuid=${argument#efifs_uuid=}
+			;;
+		update_grub_template=*)
+			update_grub_template=${argument#update_grub_template=}
+			;;
+		update_grub_cfg=*)
+			update_grub_cfg=${argument#update_grub_cfg=}
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
 function main() {
 
 	get_serial_port
@@ -971,76 +1169,12 @@ function main() {
 	# use the disk the tenant specified optionally
 	#  image_disk=/dev/nvme0n1
 	#  image_disk=smallest
-	for i in `cat /proc/cmdline`
+	local -a kernel_arguments
+	local argument
+	read -r -a kernel_arguments < /proc/cmdline
+	for argument in "${kernel_arguments[@]}"
 	do
-		#echo $line
-		line=$(echo $i|grep image_url)
-		if [ ! -z "$line" ]; then
-			image_url=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_sha)
-		if [ ! -z "$line" ]; then
-			image_sha=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_auth_type)
-		if [ ! -z "$line" ]; then
-			image_auth_type=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_auth_token)
-		if [ ! -z "$line" ]; then
-			image_auth_token=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_disk)
-		if [ ! -z "$line" ]; then
-			image_disk=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_distro_name)
-		if [ ! -z "$line" ]; then
-			distro_name=$(echo $line|cut -d'=' -f2|tr '[:upper:]' '[:lower:]')
-		fi
-		line=$(echo $i|grep image_distro_version)
-		if [ ! -z "$line" ]; then
-			distro_version=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep image_distro_release)
-		if [ ! -z "$line" ]; then
-			distro_release=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'ds=nocloud')
-		if [ ! -z "$line" ]; then
-			cloud_init_url=$(echo $line|cut -d'=' -f3)
-		fi
-		line=$(echo $i|grep 'create_forge_test_user')
-		if [ ! -z "$line" ]; then
-			user_pass=$(echo $line|cut -d'=' -f2)
-			forge_test_user=$(echo $user_pass|cut -d':' -f1)
-			forge_test_pass=$(echo $user_pass|cut -d':' -f2)
-		fi
-		line=$(echo $i|grep 'rootfs_uuid')
-		if [ ! -z "$line" ]; then
-			rootfs_uuid=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'rootfs_label')
-		if [ ! -z "$line" ]; then
-			rootfs_label=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'bootfs_uuid')
-		if [ ! -z "$line" ]; then
-			bootfs_uuid=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'efifs_uuid')
-		if [ ! -z "$line" ]; then
-			efifs_uuid=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'update_grub_template')
-		if [ ! -z "$line" ]; then
-			update_grub_template=$(echo $line|cut -d'=' -f2)
-		fi
-		line=$(echo $i|grep 'update_grub_cfg')
-		if [ ! -z "$line" ]; then
-			update_grub_cfg=$(echo $line|cut -d'=' -f2)
-		fi
-
+		parse_kernel_cmdline_argument "$argument" || true
 	done
 	if [ -z "$rootfs_uuid" ] && [ -z "$rootfs_label" ]; then
 		rootfs_label="cloudimg-rootfs" #default rootfs name for cloud images
@@ -1055,19 +1189,22 @@ function main() {
 		return 1;
 	fi
 
-	if [ -z $file ]; then
-		file=$(basename $image_url)
+	if ! build_image_auth_args; then
+		echo "Failed to prepare image authentication" | tee "$log_output"
+		return 1
+	fi
+	if [ -n "$image_auth_header_file" ]; then
+		# Safety net for an interrupted download: the normal-path cleanup
+		# below removes the file and clears this trap once curl_url returns.
+		trap 'rm -f "$image_auth_header_file"' EXIT INT TERM
 	fi
 
-	if [ ! -z "$image_auth_token" ]; then
-		if [ -z "$image_auth_type" ]; then
-		       image_auth_type=Bearer
-		fi
-		image_auth="-H \"Authorization: $image_auth_type $image_auth_token\""
+	announce_image_download
+	curl_url "$image_url" "${image_auth[@]}"
+	if [ -n "$image_auth_header_file" ]; then
+		rm -f "$image_auth_header_file"
+		trap - EXIT INT TERM
 	fi
-
-	echo "Downloading image from $image_url" | tee $log_output
-	curl_url $image_url $image_auth
 	if [ ! -z "$image_sha" ]; then
 		echo "Verifying image with digest $image_sha" | tee $log_output
 		verify_sha $image_sha
@@ -1093,7 +1230,7 @@ function main() {
 	precheck_image_identifiers || return 1
 
 	echo "Imaging $file to $image_disk" | tee $log_output
-	qemu-img convert -p -O raw -S 0 $file $image_disk 2>&1 | tee $log_output
+	qemu-img convert -p -O raw -S 0 "$file" "$image_disk" 2>&1 | tee $log_output
 	ret=$?
 	if [ $ret -ne 0 ]; then
 		echo "Imaging failed $ret" | tee $log_output

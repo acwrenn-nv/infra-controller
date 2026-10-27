@@ -20,8 +20,11 @@ mod dpu_service_sync_release;
 mod happy_path;
 mod reprovisioning;
 mod stale_labels;
+mod update_preflight;
 mod waiting_for_ready;
 
+use carbide_dpf::{DpuPhase, DpuPhaseObservation, DpuServiceVersion};
+use carbide_machine_controller::dpf::MockDpfOperations;
 use model::machine::ManagedHostState;
 
 use crate::tests::common::api_fixtures::TestEnv;
@@ -43,10 +46,54 @@ fn dpf_config() -> crate::cfg::file::DpfConfig {
     }
 }
 
+/// Models the successful DPF service lookup after the fixture registers a DPU CR.
+pub(super) fn expect_dpf_service_inventory(mock: &mut MockDpfOperations) {
+    mock.expect_get_service_versions_for_dpu().returning(|_| {
+        Ok(vec![DpuServiceVersion {
+            name: "test-service".to_string(),
+            version: "test-version".to_string(),
+            url: "https://example.com/test-service".to_string(),
+        }])
+    });
+}
+
 // Reads the host's committed state straight from the database rather than through the RPC
 // surface, which is what these suites assert transitions against.
 async fn get_host_state(env: &TestEnv, mh: &TestManagedHost) -> ManagedHostState {
     let mut txn = env.db_txn().await;
     let machine = mh.host().db_machine(&mut txn).await;
     machine.state.value
+}
+
+async fn assert_provisioning_suppressed(env: &TestEnv, mh: &TestManagedHost, expected: bool) {
+    use model::bmc_suppression::{BmcSuppressionSource, BmcSuppressionSubsystem};
+    let mut txn = env.db_txn().await;
+    let host = mh.host().db_machine(&mut txn).await;
+    let dpu = mh.dpu().db_machine(&mut txn).await;
+    for mac in [
+        host.status.bmc_info.mac.unwrap(),
+        dpu.status.bmc_info.mac.unwrap(),
+    ] {
+        let row = db::bmc_suppression::find(
+            txn.as_mut(),
+            mac,
+            BmcSuppressionSubsystem::SiteExplorer,
+            BmcSuppressionSource::DpfProvisioning,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            row.is_some(),
+            expected,
+            "provisioning suppression for {mac}"
+        );
+    }
+}
+
+/// Builds an operator observation for fixtures that do not report a failure.
+pub(super) fn phase_observation(phase: DpuPhase) -> DpuPhaseObservation {
+    DpuPhaseObservation {
+        phase,
+        failure: None,
+    }
 }

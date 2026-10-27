@@ -17,7 +17,7 @@
 use carbide_uuid::machine::MachineId;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{BomValidating, ManagedHostState};
-use model::sku::Sku;
+use model::sku::{Sku, SkuComponentsReplacement};
 use rpc::forge::{RemoveSkuRequest, SkuIdList};
 use tonic::{Request, Response, Status};
 
@@ -110,7 +110,7 @@ pub(crate) async fn assign_to_machine(
     let mut txn = api.txn_begin().await?;
 
     let sku_machine_pair = request.into_inner();
-    let machine_id = convert_and_log_machine_id(sku_machine_pair.machine_id.as_ref())?;
+    let machine_id: MachineId = convert_and_log_machine_id(sku_machine_pair.machine_id.as_ref())?;
 
     let machine =
         db::machine::find_one(&mut txn, &machine_id, MachineSearchConfig::default()).await?;
@@ -177,7 +177,7 @@ pub(crate) async fn verify_for_machine(
     request: Request<MachineId>,
 ) -> Result<Response<()>, Status> {
     log_request_data(&request);
-    let machine_id = convert_and_log_machine_id(Some(&request.into_inner()))?;
+    let machine_id: MachineId = convert_and_log_machine_id(Some(&request.into_inner()))?;
 
     let mut txn = api.txn_begin().await?;
 
@@ -216,7 +216,7 @@ pub(crate) async fn remove_sku_association(
 ) -> Result<Response<()>, Status> {
     log_request_data(&request);
     let request = request.into_inner();
-    let machine_id = convert_and_log_machine_id(request.machine_id.as_ref())?;
+    let machine_id: MachineId = convert_and_log_machine_id(request.machine_id.as_ref())?;
 
     let mut txn = api.txn_begin().await?;
 
@@ -332,8 +332,51 @@ pub(crate) async fn replace_sku(
     let mut txn = api.txn_begin().await?;
 
     let sku = db::sku::replace(&mut txn, &request).await?;
+    let rpc_sku = sku_with_machine_associations(&mut txn, sku).await?;
 
     txn.commit().await?;
 
-    Ok(Response::new(sku.into()))
+    Ok(Response::new(rpc_sku))
+}
+
+pub(crate) async fn replace_sku_components(
+    api: &Api,
+    request: Request<::rpc::forge::ReplaceSkuComponentsRequest>,
+) -> Result<Response<rpc::forge::Sku>, Status> {
+    // The request logger truncates by byte offset. Escaping first keeps a
+    // Unicode SKU ID or metadata value from being split inside a character.
+    crate::api::log_request_data_redacted(
+        format!("{:?}", request.get_ref())
+            .escape_default()
+            .to_string(),
+    );
+    let replacement: SkuComponentsReplacement = request
+        .into_inner()
+        .try_into()
+        .map_err(CarbideError::from)?;
+    let mut txn = api.txn_begin().await.map_err(CarbideError::from)?;
+
+    let sku = db::sku::replace_components(&mut txn, replacement)
+        .await
+        .map_err(CarbideError::from)?;
+    let rpc_sku = sku_with_machine_associations(&mut txn, sku)
+        .await
+        .map_err(CarbideError::from)?;
+
+    txn.commit().await.map_err(CarbideError::from)?;
+
+    Ok(Response::new(rpc_sku))
+}
+
+async fn sku_with_machine_associations(
+    txn: &mut sqlx::PgConnection,
+    sku: Sku,
+) -> Result<rpc::forge::Sku, db::DatabaseError> {
+    let mut rpc_sku: rpc::forge::Sku = sku.into();
+    let mut machine_ids_by_sku_ids =
+        db::machine::find_machine_ids_by_sku_ids(txn, std::slice::from_ref(&rpc_sku.id)).await?;
+    if let Some(associated_machine_ids) = machine_ids_by_sku_ids.remove(&rpc_sku.id) {
+        rpc_sku.associated_machine_ids = associated_machine_ids;
+    }
+    Ok(rpc_sku)
 }

@@ -186,7 +186,8 @@ func TestJwksConfig_UpdateJWKs(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				// Return a valid JWKS with at least one key
-				w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
+				// Mock response writes are best-effort if the client closes the connection.
+				_, _ = w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
 			},
 			expectError: false,
 		},
@@ -195,7 +196,7 @@ func TestJwksConfig_UpdateJWKs(t *testing.T) {
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"keys": [invalid json`))
+				_, _ = w.Write([]byte(`{"keys": [invalid json`))
 			},
 			expectError:   true,
 			errorContains: "invalid",
@@ -241,6 +242,142 @@ func TestJwksConfig_UpdateJWKs(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("failed update is throttled while cache is empty", func(t *testing.T) {
+		requestCount := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCount++
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+
+		config := &JwksConfig{
+			URL:    server.URL,
+			Issuer: "test.example.com",
+		}
+
+		require.Error(t, config.UpdateJWKS())
+		assert.False(t, config.LastAttempted.IsZero())
+		assert.True(t, config.LastUpdated.IsZero())
+
+		assert.ErrorIs(t, config.UpdateJWKS(), core.ErrJWKSNotInitialized)
+		assert.Equal(t, 1, requestCount)
+
+		config.Lock()
+		config.LastAttempted = time.Now().Add(-minUpdateInterval)
+		config.Unlock()
+
+		require.Error(t, config.UpdateJWKS())
+		assert.Equal(t, 2, requestCount)
+	})
+
+	t.Run("in-flight update remains retryable", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			warmCache bool
+		}{
+			{name: "cold cache"},
+			{name: "warm cache", warmCache: true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				require.NoError(t, err)
+
+				requestStarted := make(chan struct{})
+				releaseResponse := make(chan struct{})
+				responseResult := make(chan error, 2)
+				var requestStartedOnce sync.Once
+				var releaseResponseOnce sync.Once
+				release := func() {
+					releaseResponseOnce.Do(func() { close(releaseResponse) })
+				}
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requestStartedOnce.Do(func() { close(requestStarted) })
+					<-releaseResponse
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, writeErr := w.Write([]byte(createJWKSResponse(privateKey.Public().(*rsa.PublicKey), "new-key-id", "RS256", "sig")))
+					responseResult <- writeErr
+				}))
+				defer server.Close()
+				defer release()
+
+				config := &JwksConfig{
+					URL:    server.URL,
+					Issuer: "test.example.com",
+				}
+				if tt.warmCache {
+					oldPrivateKey, keyErr := rsa.GenerateKey(rand.Reader, 2048)
+					require.NoError(t, keyErr)
+					config.jwks = &core.JWKS{Set: &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+						Key:       oldPrivateKey.Public(),
+						KeyID:     "old-key-id",
+						Algorithm: "RS256",
+						Use:       "sig",
+					}}}}
+				}
+
+				tokenString, err := createTokenWithGoJose(privateKey, true, "new-key-id")
+				require.NoError(t, err)
+				updateResult := make(chan error, 1)
+				go func() {
+					updateResult <- config.UpdateJWKS()
+				}()
+
+				select {
+				case <-requestStarted:
+				case <-time.After(2 * time.Second):
+					t.Fatal("timed out waiting for JWKS request to start")
+				}
+
+				type validationResult struct {
+					token *jwt.Token
+					err   error
+				}
+				validationDone := make(chan validationResult, 1)
+				go func() {
+					token, validationErr := config.ValidateToken(tokenString, jwt.MapClaims{})
+					validationDone <- validationResult{token: token, err: validationErr}
+				}()
+
+				select {
+				case result := <-validationDone:
+					t.Fatalf("validation returned before the in-flight update completed: %v", result.err)
+				case <-time.After(50 * time.Millisecond):
+				}
+
+				release()
+				select {
+				case err := <-responseResult:
+					require.NoError(t, err)
+				case <-time.After(2 * time.Second):
+					t.Fatal("timed out waiting for JWKS response")
+				}
+				select {
+				case err := <-updateResult:
+					require.NoError(t, err)
+				case <-time.After(2 * time.Second):
+					t.Fatal("timed out waiting for JWKS update")
+				}
+				select {
+				case result := <-validationDone:
+					require.NoError(t, result.err)
+					require.NotNil(t, result.token)
+					assert.True(t, result.token.Valid)
+				case <-time.After(2 * time.Second):
+					t.Fatal("timed out waiting for token validation")
+				}
+				select {
+				case err := <-responseResult:
+					t.Fatalf("token validation started an unexpected second JWKS request: %v", err)
+				default:
+				}
+			})
+		}
+	})
 }
 
 // TestJwksConfig_Concurrency tests thread safety of JWKS operations
@@ -249,7 +386,7 @@ func TestJwksConfig_Concurrency(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"keys": [
 				{
 					"kty": "RSA",
@@ -373,7 +510,7 @@ func TestJwksConfig_LastUpdate(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		// Return a valid JWKS with at least one key
-		w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
+		_, _ = w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
 	}))
 	defer server.Close()
 
@@ -413,7 +550,7 @@ func TestJwksConfig_ThrottlingMechanism(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
+		_, _ = w.Write([]byte(`{"keys": [{"kty":"RSA","use":"sig","kid":"test-key-1","alg":"RS256","n":"test-n-value","e":"AQAB"}]}`))
 	}))
 	defer server.Close()
 
@@ -574,6 +711,51 @@ func TestGetKeyFromJWKS_NoKidWithAlgorithm(t *testing.T) {
 	}
 }
 
+// TestJwksConfig_ValidateTokenRequiresExpiration guards that a correctly
+// signed token without exp is rejected, rather than staying valid until its
+// signing key is rotated out.
+func TestJwksConfig_ValidateTokenRequiresExpiration(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	jwksServer := createMockJWKSServerWithKeys(t, []testKeyInfo{
+		{key: privateKey.Public(), keyId: "rsa-key-1", algorithm: "RS256", use: "sig"},
+	})
+	defer jwksServer.Close()
+	jwksConfig := NewJwksConfig("test-config", jwksServer.URL, "test-issuer", TokenOriginKasSsa, false, nil, nil)
+	require.NoError(t, jwksConfig.UpdateJWKS())
+
+	tests := []struct {
+		name    string
+		claims  jwt.MapClaims
+		wantErr error
+	}{
+		{
+			name:    "signed token without exp is rejected",
+			claims:  jwt.MapClaims{"iss": "test-issuer", "sub": "test-subject"},
+			wantErr: jwt.ErrTokenRequiredClaimMissing,
+		},
+		{
+			name:   "signed token with a future exp is accepted",
+			claims: jwt.MapClaims{"iss": "test-issuer", "sub": "test-subject", "exp": time.Now().Add(time.Hour).Unix()},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsigned := jwt.NewWithClaims(jwt.SigningMethodRS256, tt.claims)
+			unsigned.Header["kid"] = "rsa-key-1"
+			tokenString, err := unsigned.SignedString(privateKey)
+			require.NoError(t, err)
+
+			_, err = jwksConfig.ValidateToken(tokenString, jwt.MapClaims{})
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // testKeyInfo represents key information for testing
 type testKeyInfo struct {
 	key       interface{}
@@ -659,7 +841,7 @@ func createMockJWKSServerWithKeys(t *testing.T, keys []testKeyInfo) *httptest.Se
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(jsonData)
+		_, _ = w.Write(jsonData)
 	}))
 }
 

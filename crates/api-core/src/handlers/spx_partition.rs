@@ -15,8 +15,9 @@
  * limitations under the License.
  */
 use ::rpc::forge as rpc;
-use db::resource_pool::ResourcePoolDatabaseError;
-use db::{ObjectColumnFilter, WithTransaction, spx_partition};
+use db::resource_pool::{ResourcePoolAllocationNotOwned, ResourcePoolDatabaseError};
+use db::spx_partition::SpxPartitionAlreadyDeleted;
+use db::{ConditionalWrite, ObjectColumnFilter, WithTransaction, spx_partition};
 use futures_util::FutureExt;
 use model::resource_pool;
 use model::spx_partition::NewSpxPartition;
@@ -138,20 +139,46 @@ pub(crate) async fn delete(
         .id
         .ok_or_else(|| CarbideError::MissingArgument("id"))?;
 
-    let resp = api
-        .with_txn(|txn| db::spx_partition::mark_as_deleted(id, txn).boxed())
-        .await?
-        .map_err(CarbideError::from)?;
+    let vni_pool = api.common_pools.ethernet.pool_dpa_vni.clone();
+    api.with_txn(|txn| {
+        async move {
+            db::spx_partition::lock_for_delete(txn, id).await?;
+            // Admission may have committed while this transaction waited for
+            // the partition. Under READ COMMITTED, a separate statement takes
+            // a fresh snapshot that includes those references.
+            if db::spx_partition::has_instance_references(&mut **txn, id).await? {
+                return Err(CarbideError::FailedPrecondition(format!(
+                    "SPX partition {id} still has instance attachments"
+                )));
+            }
 
-    if let Some(vni) = resp.vni {
-        let mut txn = api.txn_begin().await?;
+            let vni = match db::spx_partition::mark_as_deleted(id, txn).await? {
+                ConditionalWrite::Applied(partition) => partition.vni,
+                ConditionalWrite::NotApplied(SpxPartitionAlreadyDeleted { vni }) => vni,
+            };
 
-        db::resource_pool::release(&api.common_pools.ethernet.pool_dpa_vni, &mut txn, vni)
-            .await
-            .map_err(CarbideError::from)?;
-
-        txn.commit().await?;
-    }
+            // A persisted deletion may still have its VNI reservation. Retrying
+            // release finishes that cleanup; the owner check leaves any
+            // reservation assigned to another partition unchanged.
+            if let Some(vni) = vni {
+                match db::resource_pool::release(
+                    &vni_pool,
+                    txn,
+                    vni,
+                    resource_pool::OwnerType::SpxPartition,
+                    &id.to_string(),
+                )
+                .await?
+                {
+                    ConditionalWrite::Applied(())
+                    | ConditionalWrite::NotApplied(ResourcePoolAllocationNotOwned) => {}
+                }
+            }
+            Ok::<(), CarbideError>(())
+        }
+        .boxed()
+    })
+    .await??;
 
     Ok(Response::new(rpc::SpxPartitionDeletionResult {}))
 }
@@ -215,7 +242,7 @@ pub(crate) async fn find_by_ids(
 mod tests {
     use ::rpc::forge as rpc;
     use carbide_instrument::testing::{MetricsCapture, capture_logs};
-    use carbide_test_support::{Check, check_values};
+    use carbide_test_support::{Check, check_values, value_scenarios};
     use db::resource_pool::ResourcePoolDatabaseError;
     use model::resource_pool::common::DPA_VNI;
     use model::resource_pool::{ResourcePool, ResourcePoolError, ValueType};
@@ -235,6 +262,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum DpaVniFailureInput {
         Exhausted,
+        MissingRange,
         RequestedUnavailable,
         RequestedDatabase,
         Generic,
@@ -244,6 +272,11 @@ mod tests {
         fn error(self) -> ResourcePoolDatabaseError {
             match self {
                 Self::Exhausted => ResourcePoolError::Empty.into(),
+                Self::MissingRange => ResourcePoolError::MissingAllocationRange {
+                    pool_name: DPA_VNI.to_string(),
+                    auto_assign: false,
+                }
+                .into(),
                 Self::RequestedUnavailable => db::DatabaseError::FailedPrecondition(
                     "requested VNI is unavailable".to_string(),
                 )
@@ -266,6 +299,7 @@ mod tests {
         fn failure_label(self) -> &'static str {
             match self {
                 Self::Exhausted => "exhausted",
+                Self::MissingRange => "configuration",
                 Self::RequestedUnavailable => "requested_value_unavailable",
                 Self::RequestedDatabase => "database",
                 Self::Generic => "parse",
@@ -307,7 +341,6 @@ mod tests {
         pool: Option<String>,
         requested_vni: Option<String>,
         error: Option<String>,
-        counter_delta: f64,
     }
 
     #[test]
@@ -337,7 +370,34 @@ mod tests {
                         pool: Some(DPA_VNI.to_string()),
                         requested_vni: None,
                         error: None,
-                        counter_delta: 1.0,
+                    },
+                },
+                Check {
+                    scenario: "missing explicit range preserves configuration context",
+                    input: DpaVniFailureCase {
+                        failure: DpaVniFailureInput::MissingRange,
+                        requested_vni: Some(42),
+                    },
+                    expect: DpaVniFailureObservation {
+                        status_code: Code::FailedPrecondition,
+                        status_message: "resource-pool `dpa-vni` has no explicit allocation range"
+                            .to_string(),
+                        metadata_name: "resource_pool_allocation_failed".to_string(),
+                        level: tracing::Level::ERROR,
+                        message: "Error allocating from resource pool".to_string(),
+                        event_name: Some("resource_pool_allocation_failed".to_string()),
+                        metric_name: Some(RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC.to_string()),
+                        operation: Some("allocate".to_string()),
+                        failure: Some("configuration".to_string()),
+                        failure_policy: Some("required".to_string()),
+                        allocation_mode: Some("requested".to_string()),
+                        value_type: Some("integer".to_string()),
+                        owner_id: Some(OWNER_ID.to_string()),
+                        pool: Some(DPA_VNI.to_string()),
+                        requested_vni: None,
+                        error: Some(
+                            "resource-pool `dpa-vni` has no explicit allocation range".to_string(),
+                        ),
                     },
                 },
                 Check {
@@ -364,7 +424,6 @@ mod tests {
                         pool: Some(DPA_VNI.to_string()),
                         requested_vni: Some("42".to_string()),
                         error: None,
-                        counter_delta: 1.0,
                     },
                 },
                 Check {
@@ -390,7 +449,6 @@ mod tests {
                         pool: Some(DPA_VNI.to_string()),
                         requested_vni: None,
                         error: Some("internal error: database unavailable".to_string()),
-                        counter_delta: 1.0,
                     },
                 },
                 Check {
@@ -416,7 +474,6 @@ mod tests {
                         pool: Some(DPA_VNI.to_string()),
                         requested_vni: None,
                         error: Some(PARSE_ERROR.to_string()),
-                        counter_delta: 1.0,
                     },
                 },
             ],
@@ -437,6 +494,32 @@ mod tests {
                 assert_eq!(logs.len(), 1);
                 let log = &logs[0];
 
+                let observed = metrics.counter_delta(
+                    RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
+                    &[
+                        ("operation", "allocate"),
+                        ("failure", input.failure.failure_label()),
+                        ("failure_policy", "required"),
+                        ("allocation_mode", input.allocation_mode()),
+                        ("value_type", "integer"),
+                    ],
+                );
+                match input.failure {
+                    DpaVniFailureInput::Exhausted
+                    | DpaVniFailureInput::MissingRange
+                    | DpaVniFailureInput::RequestedUnavailable => {
+                        // VPC tests emit these labels without a `MetricsCapture`.
+                        // The log capture above checks this mapper's event.
+                        assert!(
+                            observed >= 1.0,
+                            "expected at least one {input:?} allocation failure, observed {observed}"
+                        );
+                    }
+                    DpaVniFailureInput::RequestedDatabase | DpaVniFailureInput::Generic => {
+                        assert_eq!(observed, 1.0, "{input:?}");
+                    }
+                }
+
                 DpaVniFailureObservation {
                     status_code: status.code(),
                     status_message: status.message().to_string(),
@@ -454,16 +537,6 @@ mod tests {
                     pool: log.field("pool").map(str::to_string),
                     requested_vni: log.field("requested_vni").map(str::to_string),
                     error: log.field("error").map(str::to_string),
-                    counter_delta: metrics.counter_delta(
-                        RESOURCE_POOL_LIFECYCLE_FAILURES_METRIC,
-                        &[
-                            ("operation", "allocate"),
-                            ("failure", input.failure.failure_label()),
-                            ("failure_policy", "required"),
-                            ("allocation_mode", input.allocation_mode()),
-                            ("value_type", "integer"),
-                        ],
-                    ),
                 }
             },
         );
@@ -555,21 +628,67 @@ mod tests {
     }
 
     #[test]
-    fn test_create_spx_partition_without_metadata() {
+    fn test_create_spx_partition_rejects_invalid_metadata() {
+        value_scenarios!(
+            run = |metadata| NewSpxPartition::try_from(rpc::SpxPartitionCreationRequest {
+                metadata,
+                tenant_organization_id: "tenant-org-456".to_string(),
+                ..Default::default()
+            })
+            .map(|_| ())
+            .map_err(|error| tonic::Status::from(error).code());
+            "omitted metadata cannot supply a valid name" {
+                None => Err(Code::InvalidArgument),
+            }
+            "minimum name length is required" {
+                Some(rpc::Metadata {
+                    name: "x".to_string(),
+                    ..Default::default()
+                }) => Err(Code::InvalidArgument),
+            }
+            "non-ASCII names are rejected" {
+                Some(rpc::Metadata {
+                    name: "分区".to_string(),
+                    ..Default::default()
+                }) => Err(Code::InvalidArgument),
+            }
+            "labels receive shared validation too" {
+                Some(rpc::Metadata {
+                    name: "test-partition".to_string(),
+                    labels: vec![rpc::Label {
+                        key: String::new(),
+                        value: None,
+                    }],
+                    ..Default::default()
+                }) => Err(Code::InvalidArgument),
+            }
+        );
+    }
+
+    #[test]
+    fn test_create_spx_partition_rejects_duplicate_labels() {
+        let label = rpc::Label {
+            key: "environment".to_string(),
+            value: Some("test".to_string()),
+        };
         let request = rpc::SpxPartitionCreationRequest {
-            metadata: None,
-            id: None,
-            vni: Some(200),
-            tenant_organization_id: "tenant-org-456".to_string(),
+            metadata: Some(rpc::Metadata {
+                name: "test-partition".to_string(),
+                labels: vec![label.clone(), label],
+                ..Default::default()
+            }),
+            tenant_organization_id: "tenant-org-123".to_string(),
+            ..Default::default()
         };
 
-        let result = NewSpxPartition::try_from(request);
-        assert!(result.is_ok());
-
-        let partition = result.unwrap();
-        assert!(partition.name.is_empty());
-        assert!(partition.description.is_empty());
-        assert_eq!(partition.vni, Some(200));
+        let error = NewSpxPartition::try_from(request).unwrap_err();
+        let status = tonic::Status::from(error);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("Duplicate key found: environment")
+        );
     }
 
     #[test]

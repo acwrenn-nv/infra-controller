@@ -4,11 +4,16 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -77,8 +82,10 @@ func TestNewKeycloakConfig(t *testing.T) {
 			assert.Equal(t, tt.want.ClientSecret, got.ClientSecret)
 			assert.Equal(t, tt.want.Realm, got.Realm)
 
-			// Verify initial state
-			assert.Nil(t, got.jwksConfig)
+			// The key cache can be empty, but its configuration must remain
+			// available for request-time refresh.
+			require.NotNil(t, got.jwksConfig)
+			assert.Nil(t, got.jwksConfig.GetJWKS())
 		})
 	}
 }
@@ -89,10 +96,11 @@ func TestKeycloakConfig_GetJwksConfig(t *testing.T) {
 		if strings.Contains(req.URL.Path, "/realms/test-realm/protocol/openid-connect/certs") {
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(mockKeycloakJwks))
+			// Mock response writes are best-effort if the client closes the connection.
+			_, _ = res.Write([]byte(mockKeycloakJwks))
 		} else if strings.Contains(req.URL.Path, "/realms/bad-realm/protocol/openid-connect/certs") {
 			res.WriteHeader(http.StatusNotFound)
-			res.Write([]byte(`{"error":"realm_not_found"}`))
+			_, _ = res.Write([]byte(`{"error":"realm_not_found"}`))
 		} else {
 			res.WriteHeader(http.StatusNotFound)
 		}
@@ -145,7 +153,8 @@ func TestKeycloakConfig_GetJwksConfig(t *testing.T) {
 
 			if tt.wantErr {
 				assert.Error(t, err)
-				assert.Nil(t, jwksConfig)
+				assert.NotNil(t, jwksConfig)
+				assert.Nil(t, jwksConfig.GetJWKS())
 			} else {
 				assert.NoError(t, err)
 				assert.NotNil(t, jwksConfig)
@@ -156,6 +165,65 @@ func TestKeycloakConfig_GetJwksConfig(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("recovers after initial JWKS failure", func(t *testing.T) {
+		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+
+		var keycloakReady atomic.Bool
+		var requestCount atomic.Int32
+		testServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+			requestCount.Add(1)
+			if !keycloakReady.Load() {
+				res.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+
+			res.Header().Set("Content-Type", "application/json")
+			res.WriteHeader(http.StatusOK)
+			_, err := res.Write([]byte(createJWKSResponse(privateKey.Public().(*rsa.PublicKey), "test-key-id", "RS256", "sig")))
+			assert.NoError(t, err)
+		}))
+		defer testServer.Close()
+
+		keycloakConfig := NewKeycloakConfig(
+			testServer.URL,
+			"https://keycloak.example.com",
+			"test-client",
+			"test-secret",
+			"test-realm",
+			true,
+		)
+
+		jwksConfig, err := keycloakConfig.GetJwksConfig()
+		require.Error(t, err)
+		require.NotNil(t, jwksConfig)
+		assert.Nil(t, jwksConfig.GetJWKS())
+		assert.Equal(t, int32(1), requestCount.Load())
+
+		tokenString, err := createTokenWithGoJose(privateKey, true, "test-key-id")
+		require.NoError(t, err)
+		jwksConfig.Lock()
+		jwksConfig.LastAttempted = time.Now()
+		jwksConfig.Unlock()
+		_, err = jwksConfig.ValidateToken(tokenString, jwt.MapClaims{})
+		require.Error(t, err)
+		assert.Equal(t, int32(1), requestCount.Load())
+
+		keycloakReady.Store(true)
+		jwksConfig.Lock()
+		jwksConfig.LastAttempted = time.Now().Add(-minUpdateInterval)
+		jwksConfig.Unlock()
+
+		token, err := jwksConfig.ValidateToken(tokenString, jwt.MapClaims{})
+		require.NoError(t, err)
+		require.NotNil(t, token)
+		assert.True(t, token.Valid)
+		assert.Equal(t, int32(2), requestCount.Load())
+
+		_, err = keycloakConfig.GetJwksConfig()
+		require.NoError(t, err)
+	})
 }
 
 func TestKeycloakConfig_GetJwksConfig_Caching(t *testing.T) {
@@ -166,7 +234,7 @@ func TestKeycloakConfig_GetJwksConfig_Caching(t *testing.T) {
 			requestCount++
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(mockKeycloakJwks))
+			_, _ = res.Write([]byte(mockKeycloakJwks))
 		} else {
 			res.WriteHeader(http.StatusNotFound)
 		}
@@ -202,7 +270,7 @@ func TestKeycloakConfig_GetJwksConfig_Concurrency(t *testing.T) {
 			requestCount++
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(mockKeycloakJwks))
+			_, _ = res.Write([]byte(mockKeycloakJwks))
 		} else {
 			res.WriteHeader(http.StatusNotFound)
 		}
@@ -304,14 +372,14 @@ func TestKeycloakConfig_Integration(t *testing.T) {
 		case strings.Contains(req.URL.Path, "/realms/valid-realm/protocol/openid-connect/certs"):
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(mockKeycloakJwks))
+			_, _ = res.Write([]byte(mockKeycloakJwks))
 		case strings.Contains(req.URL.Path, "/realms/invalid-realm/protocol/openid-connect/certs"):
 			res.WriteHeader(http.StatusNotFound)
-			res.Write([]byte(`{"error":"realm_not_found","error_description":"Realm does not exist"}`))
+			_, _ = res.Write([]byte(`{"error":"realm_not_found","error_description":"Realm does not exist"}`))
 		case strings.Contains(req.URL.Path, "/realms/malformed-realm/protocol/openid-connect/certs"):
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(`{"invalid":"json"`)) // Malformed JSON
+			_, _ = res.Write([]byte(`{"invalid":"json"`)) // Malformed JSON
 		default:
 			res.WriteHeader(http.StatusNotFound)
 		}
@@ -343,7 +411,8 @@ func TestKeycloakConfig_Integration(t *testing.T) {
 			wantErr: true,
 			validate: func(t *testing.T, jwks *JwksConfig, err error) {
 				assert.Error(t, err)
-				assert.Nil(t, jwks)
+				assert.NotNil(t, jwks)
+				assert.Nil(t, jwks.GetJWKS())
 				assert.Contains(t, err.Error(), "failed to fetch JWKS")
 			},
 		},
@@ -353,7 +422,8 @@ func TestKeycloakConfig_Integration(t *testing.T) {
 			wantErr: true,
 			validate: func(t *testing.T, jwks *JwksConfig, err error) {
 				assert.Error(t, err)
-				assert.Nil(t, jwks)
+				assert.NotNil(t, jwks)
+				assert.Nil(t, jwks.GetJWKS())
 			},
 		},
 	}
@@ -372,7 +442,7 @@ func TestKeycloakConfig_Integration(t *testing.T) {
 			} else {
 				if tt.wantErr {
 					assert.Error(t, err)
-					assert.Nil(t, jwksConfig)
+					assert.NotNil(t, jwksConfig)
 				} else {
 					assert.NoError(t, err)
 					assert.NotNil(t, jwksConfig)
@@ -434,11 +504,11 @@ func TestKeycloakConfig_ErrorHandling(t *testing.T) {
 			return
 		case strings.Contains(req.URL.Path, "/realms/error-realm/"):
 			res.WriteHeader(http.StatusInternalServerError)
-			res.Write([]byte(`{"error":"internal_server_error"}`))
+			_, _ = res.Write([]byte(`{"error":"internal_server_error"}`))
 		case strings.Contains(req.URL.Path, "/realms/empty-realm/"):
 			res.WriteHeader(http.StatusOK)
 			res.Header().Set("Content-Type", "application/json")
-			res.Write([]byte(`{}`)) // Empty but valid JSON
+			_, _ = res.Write([]byte(`{}`)) // Empty but valid JSON
 		default:
 			res.WriteHeader(http.StatusNotFound)
 		}
@@ -473,7 +543,8 @@ func TestKeycloakConfig_ErrorHandling(t *testing.T) {
 
 			if tt.wantErr {
 				assert.Error(t, err)
-				assert.Nil(t, jwksConfig)
+				assert.NotNil(t, jwksConfig)
+				assert.Nil(t, jwksConfig.GetJWKS())
 			} else {
 				assert.NoError(t, err)
 				assert.NotNil(t, jwksConfig)

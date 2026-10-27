@@ -46,10 +46,12 @@ impl PreingestionMetrics {
     }
 }
 fn hydrate_meter(meter: Meter, shared_metrics: SharedMetricsHolder<PreingestionMetrics>) {
-    {
+    // Preserve carbide_preingestion_total for existing queries; both names
+    // report the current machine count, which can decrease.
+    for name in ["carbide_preingestion_total", "carbide_preingestion_count"] {
         let metrics = shared_metrics.clone();
         meter
-            .u64_observable_gauge("carbide_preingestion_total")
+            .u64_observable_gauge(name)
             .with_description(
                 "Number of known machines currently being evaluated prior to ingestion",
             )
@@ -748,7 +750,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use carbide_instrument::testing::{MetricsCapture, capture_logs};
+    use carbide_instrument::testing::{ApproxHistogramSum, MetricsCapture, capture_logs};
     use carbide_test_support::{Check, check_values, value_scenarios};
     use carbide_utils::test_support::test_meter::TestMeter;
     use prometheus_text_parser::ParsedPrometheusMetrics;
@@ -763,7 +765,18 @@ mod tests {
         metrics.machines_in_preingestion = 20;
         let test_meter = TestMeter::default();
 
+        let expired_meter = TestMeter::default();
+        let expired_holder = MetricHolder::new(expired_meter.meter(), Duration::ZERO);
+        expired_holder.update_metrics(metrics.clone());
+
         let metric_holder = Arc::new(MetricHolder::new(test_meter.meter(), Duration::MAX));
+        let initial_export = test_meter.export_metrics();
+        for name in ["carbide_preingestion_total", "carbide_preingestion_count"] {
+            assert!(
+                !initial_export.contains(name),
+                "{name} must be absent before the first metrics update"
+            );
+        }
         metric_holder.update_metrics(metrics);
 
         assert_eq!(
@@ -775,6 +788,16 @@ mod tests {
                 .parse::<ParsedPrometheusMetrics>()
                 .unwrap()
         );
+
+        let expired_export = expired_meter.export_metrics();
+        for name in ["carbide_preingestion_total", "carbide_preingestion_count"] {
+            assert!(!expired_export.contains(name));
+        }
+
+        metric_holder.update_metrics(PreingestionMetrics::new());
+        for name in ["carbide_preingestion_total", "carbide_preingestion_count"] {
+            assert_eq!(test_meter.formatted_metric(name), Some("0".to_string()));
+        }
     }
 
     /// The label vocabularies are the dashboard contract: every power
@@ -906,9 +929,10 @@ mod tests {
                 "carbide_preingestion_bfb_copy_duration_seconds",
                 &[("outcome", outcome)],
             );
-            assert!(
-                (sum - seconds).abs() < 1e-9,
-                "outcome={outcome} records {seconds}s, got {sum}"
+            assert_eq!(
+                sum,
+                ApproxHistogramSum(seconds),
+                "outcome={outcome} records {seconds}s"
             );
         }
     }

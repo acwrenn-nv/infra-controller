@@ -23,9 +23,12 @@ const (
 type Options struct {
 	Addr         string
 	InsecureAddr string
-	DNSName      string
-	CABaseDNS    string
-	sentryDSN    string
+	// DNSNames are the hostnames the TLS listener's certificate must match.
+	// Every name clients dial has to appear here, because hostname
+	// verification only consults the certificate's SANs.
+	DNSNames  []string
+	CABaseDNS string
+	sentryDSN string
 }
 
 // Server defines a server
@@ -54,7 +57,7 @@ func NewServerWithIssuer(ctx context.Context, o Options, certIssuer CertificateI
 	appService.AddHealthRoute(ctx)
 	appService.AddVersionRoute(ctx)
 	appService.AddMetricsRoute(ctx)
-	appService.Use(core.NewHTTPMiddleware(ctx, core.WithRequestMetrics("cloud_cert_manager"))...)
+	appService.Use(core.NewHTTPMiddleware(ctx, core.WithRequestMetrics("nico_rest_cert_manager"))...)
 	appService.Path("/v1/pki/ca").Handler(s.PKICACertificateHandler(ctx)).Methods("GET")
 	appService.Path("/v1/pki/ca/pem").Handler(s.PKICACertificateHandler(ctx)).Methods("GET")
 	appService.Path("/v1/pki/cloud-cert").Handler(s.PKICloudCertificateHandler(ctx)).Methods("POST")
@@ -91,6 +94,19 @@ func (s *Server) Start(ctx context.Context) {
 	}
 }
 
+// Done returns a channel closed once both HTTP services have stopped serving.
+func (s *Server) Done() <-chan struct{} {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		<-s.appService.Done()
+		<-s.insecService.Done()
+	}()
+
+	return done
+}
+
 // PKICACertificateHandler returns pkiCACertificateHandler
 func (s *Server) PKICACertificateHandler(_ context.Context) http.Handler {
 	h := &pkiCACertificateHandler{
@@ -111,7 +127,7 @@ func (s *Server) PKICloudCertificateHandler(_ context.Context) http.Handler {
 
 func (s *Server) tlsSetup(ctx context.Context) error {
 	i := s.certificateIssuer
-	cert, key, err := i.RawCertificate(ctx, s.DNSName, svcTTL)
+	cert, key, err := i.RawCertificate(ctx, s.DNSNames, svcTTL)
 	if err != nil {
 		return err
 	}

@@ -19,15 +19,16 @@ use std::borrow::Cow;
 
 use ::rpc::protos::mlx_device as mlx_device_pb;
 use carbide_host_support::dpa_cmds::{DpaCommand, DpaDeviceCommand, OpCode};
-use carbide_uuid::machine::MachineId;
+use carbide_libmlx_model::firmware::operation::{FirmwareOperation, FirmwareOperationState};
+use carbide_uuid::machine::HostMachineId;
 use db::dpa_interface;
 use eyre::eyre;
 use libmlx::device::report::MlxDeviceReport;
 use libmlx::profile::serialization::SerializableProfile;
 use mac_address::MacAddress;
 use model::dpa_interface::{
-    CardState, DpaInterface, DpaInterfaceControllerState, DpaInterfaceType, DpaLockMode,
-    DpaSearchConfig, NewDpaInterface,
+    DpaInterface, DpaInterfaceControllerState, DpaInterfaceType, DpaLockMode, DpaSearchConfig,
+    NewDpaInterface,
 };
 use rpc::forge_agent_control_response as fac;
 use rpc::forge_agent_control_response::MlxDeviceAction;
@@ -48,7 +49,7 @@ use crate::{CarbideError, CarbideResult};
 /// If there is work to be done, return an MLX action with per-device commands.
 pub(super) async fn process_scout_req(
     api: &Api,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
 ) -> CarbideResult<fac::Action> {
     if !api.runtime_config.is_ewethers_enabled() || !api.runtime_config.is_svpc_enabled() {
         tracing::info!(
@@ -76,6 +77,12 @@ pub(super) async fn process_scout_req(
         );
         return Ok(fac::Action::noop());
     }
+
+    // Whether a tenant-allocation lock this pass should migrate the card to the
+    // site-wide target. It is host-scoped (the same for every card) and needed
+    // only if some card actually reaches `Locking`, so it is resolved lazily and
+    // cached here -- at most one read per pass, and none when no card locks.
+    let mut rotate_lockdown_key: Option<bool> = None;
 
     let mut device_actions = Vec::new();
 
@@ -106,7 +113,30 @@ pub(super) async fn process_scout_req(
                 build_apply_profile_command(api, sn, machine_id, pci_name)?
             }
             DpaInterfaceControllerState::Locking => {
-                build_lock_command(api, sn, machine_id, pci_name).await?
+                // Tenant-allocation lock: migrate to the site-wide target when the
+                // gate is on or this host is force-flagged, otherwise re-lock at
+                // the card's current version. Resolve+cache the host-scoped
+                // decision on the first `Locking` card of the pass.
+                let rotate = match rotate_lockdown_key {
+                    Some(v) => v,
+                    None => {
+                        let v = resolve_rotate_lockdown_key(api, machine_id).await?;
+                        rotate_lockdown_key = Some(v);
+                        v
+                    }
+                };
+                build_lock_command(api, sn, machine_id, pci_name, rotate).await?
+            }
+            DpaInterfaceControllerState::RotateKeyUnlocking => {
+                // Tenant-free lockdown rotation in progress: unlock nic
+                build_unlock_command(api, sn, machine_id, pci_name).await?
+            }
+            DpaInterfaceControllerState::RotateKeyLocking => {
+                // Tenant-free lockdown rotation in progress: relock at the
+                // site-wide target unconditionally. Entering this state already
+                // committed to migrating (the unlock phase NULLed the card's
+                // current version), so this must not consult the gate.
+                build_lock_command(api, sn, machine_id, pci_name, true).await?
             }
         };
 
@@ -128,8 +158,30 @@ pub(super) async fn process_scout_req(
     Ok(fac::Action::MlxAction(fac::MlxAction { device_actions }))
 }
 
-/// Resolve the lockdown IKM version to *lock* a card under on this assignment
-/// cycle.
+/// Decide whether a tenant-allocation lock should migrate the host's cards to
+/// the site-wide lockdown IKM target this pass.
+///
+/// The site-wide `nic_lockdown_ikm_rotation_enabled` gate is the lazy-migration
+/// switch: when on, cards migrate to the new IKM as tenants cycle. The per-host
+/// `lockdown_ikm_credential_rotation_requested` force flag overrides it so an
+/// operator can converge a single host while the site-wide gate is still off.
+///
+/// The gate is checked first so the host-scoped DB read is skipped whenever the
+/// gate is on (the answer is already `true`); the force flag is only consulted
+/// when the gate is off.
+async fn resolve_rotate_lockdown_key(api: &Api, machine_id: HostMachineId) -> CarbideResult<bool> {
+    if api.runtime_config.nic_lockdown_ikm_rotation_enabled {
+        return Ok(true);
+    }
+    let mut conn = api.database_connection.acquire().await.map_err(|e| {
+        CarbideError::GenericErrorFromReport(eyre!(
+            "failed to acquire connection to read nic lockdown force flag: {e}"
+        ))
+    })?;
+    Ok(db::machine::get_lockdown_ikm_credential_rotation_requested(&mut conn, machine_id).await?)
+}
+
+/// Resolve the lockdown IKM version to *lock* a card under.
 ///
 /// An in-flight lock takes precedence over either branch below: if a lock is
 /// already staged (`rotating_to_version` set), we re-derive that exact version.
@@ -139,14 +191,23 @@ pub(super) async fn process_scout_req(
 /// lockmode, never the version). Re-reading the site-wide target or the card's
 /// last-confirmed `current_version` on a later reconciliation could overwrite the
 /// staged marker and record a convergence version the hardware was never on --
-/// e.g. if `lockdown_ikm_rotation_enabled` flips between staging the lock and
-/// observing it. This mirrors the unlock path, which already prefers
-/// `rotating_to_version`.
+/// e.g. if the migration decision flips between staging the lock and observing
+/// it. This mirrors the unlock path, which already prefers `rotating_to_version`.
 ///
-/// When no lock is in flight, the branch is chosen by the flag. With
-/// `lockdown_ikm_rotation_enabled`, this is the staged site-wide target, so
-/// cards migrate forward to the new IKM as tenants cycle (the lazy-migration
-/// path). With rotation disabled -- the default -- it is the card's own current
+/// When no lock is in flight, the version is chosen by `migrate_to_target`. The
+/// caller owns that decision, so this resolver is shared by both lock paths:
+///
+/// - The tenant-allocation `Locking` passes `force || nic_lockdown_ikm_rotation_enabled`.
+///   The site-wide flag is the lazy-migration gate (cards migrate to the new IKM
+///   as tenants cycle); the per-host force flag overrides it so an operator can
+///   converge one host even while the site-wide gate is off.
+/// - The idle `RotateKeyLocking` passes `true` unconditionally: entering that
+///   state is itself the commitment to migrate (the unlock phase already NULLed
+///   `current_version`), so it must resolve to the target regardless of the flag
+///   -- otherwise a mid-rekey kill-switch flip would fall through to the seed and
+///   silently downgrade the card.
+///
+/// When `migrate_to_target` is false, the version is the card's own current
 /// tracked version, so a staged `RotateCredential(lockdown_ikm)` target does not
 /// migrate any card until the deliberate cutover flip, and an already-migrated
 /// card re-locks at the version it is on rather than being reverted.
@@ -154,11 +215,14 @@ pub(super) async fn process_scout_req(
 /// The two branches resolve their fallback differently on purpose. The site-wide
 /// `lockdown_ikm` target row is seeded for every site by the backfill migration
 /// (and by `set_initial_target_version` on the first `RotateCredential`), so a
-/// missing target is a corrupted invariant we surface rather than paper over --
-/// mirroring `record_device_converged`. A per-card row, by contrast, is created
-/// lazily on first lock and only backfilled for already-locked cards, so a card
-/// with no row / no tracked version legitimately falls back to the seed version.
-async fn resolve_lock_ikm_version(api: &Api, mac: MacAddress) -> CarbideResult<i32> {
+/// missing target returns `MissingSitewideRotationTarget`. A per-card row is
+/// created lazily on first lock and only backfilled for already-locked cards,
+/// so a card with no row / no tracked version falls back to the seed version.
+async fn resolve_lock_ikm_version(
+    api: &Api,
+    mac: MacAddress,
+    migrate_to_target: bool,
+) -> CarbideResult<i32> {
     let mut conn = api.database_connection.acquire().await.map_err(|e| {
         CarbideError::GenericErrorFromReport(eyre!(
             "failed to acquire connection to resolve lockdown lock IKM version: {e}"
@@ -179,7 +243,7 @@ async fn resolve_lock_ikm_version(api: &Api, mac: MacAddress) -> CarbideResult<i
     // Versions stay DB-native `i32` throughout this handler (Postgres has no
     // unsigned int); the sole `u32` conversion happens once at the derivation
     // boundary (`ikm_version_u32` -> `build_supernic_lockdown_key`).
-    let version = if api.runtime_config.lockdown_ikm_rotation_enabled {
+    let version = if migrate_to_target {
         db::credential_rotation::current_target_version(
             &mut conn,
             db::credential_rotation::CredentialRotationType::LockdownIkm,
@@ -202,7 +266,7 @@ async fn resolve_lock_ikm_version(api: &Api, mac: MacAddress) -> CarbideResult<i
 /// under it), otherwise the last-confirmed `current_version`, otherwise the seed
 /// version for a card with no tracked lock yet.
 ///
-/// This is always version-aware, independent of `lockdown_ikm_rotation_enabled`: a
+/// This is always version-aware, independent of `nic_lockdown_ikm_rotation_enabled`: a
 /// card that already migrated to a newer IKM must be unlocked with that IKM, or
 /// it would be bricked. Because the assignment cycle always unlocks a card
 /// before re-locking it, a locked card's version is always exactly this resolved
@@ -230,7 +294,7 @@ async fn resolve_unlock_ikm_version(api: &Api, mac: MacAddress) -> CarbideResult
 async fn build_unlock_command(
     api: &Api,
     sn: &DpaInterface,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     pci_name: &str,
 ) -> CarbideResult<DpaCommand<'static>> {
     // DB-native `i32`; converted to the `u32` the derivation layer uses. The
@@ -269,7 +333,7 @@ async fn build_unlock_command(
 fn build_apply_firmware_command<'a>(
     api: &'a Api,
     sn: &DpaInterface,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     pci_name: &str,
 ) -> DpaCommand<'a> {
     // Look up a FirmwareFlasherProfile for the device's PN:PSID
@@ -333,6 +397,7 @@ fn build_apply_firmware_command<'a>(
     DpaCommand {
         op: OpCode::ApplyFirmware {
             profile: profile.map(Box::new),
+            operation_id: sn.firmware_operation_id(),
         },
     }
 }
@@ -354,7 +419,7 @@ fn build_apply_firmware_command<'a>(
 fn build_apply_profile_command(
     api: &Api,
     interface: &DpaInterface,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     pci_name: &str,
 ) -> CarbideResult<DpaCommand<'static>> {
     let Some(profile_name) = &interface.mlxconfig_profile else {
@@ -404,18 +469,32 @@ fn build_apply_profile_command(
 }
 
 /// Build and return a command to lock the DPA.
+///
+/// `migrate_to_target` selects the lock version via [`resolve_lock_ikm_version`]:
+/// the tenant-allocation `Locking` passes `force || nic_lockdown_ikm_rotation_enabled`
+/// (lazy migration, overridable per host), while the idle `RotateKeyLocking`
+/// passes `true` because entering that state already committed to converging on
+/// the site-wide target.
 async fn build_lock_command(
     api: &Api,
     sn: &DpaInterface,
-    machine_id: MachineId,
+    machine_id: HostMachineId,
     pci_name: &str,
+    migrate_to_target: bool,
 ) -> CarbideResult<DpaCommand<'static>> {
-    // Resolve the IKM version to lock this card under: the site-wide target when
-    // rotation is enabled, else the card's current version (see
-    // `resolve_lock_ikm_version`). Kept as DB-native `i32` for the staging write
-    // below, and converted to `u32` for the derivation layer; the rotation
-    // columns carry a non-negative CHECK, so a negative is a corrupted invariant.
-    let target_version = resolve_lock_ikm_version(api, sn.mac_address).await?;
+    let target_version = resolve_lock_ikm_version(api, sn.mac_address, migrate_to_target).await?;
+    lock_command_for_target(api, sn, machine_id, pci_name, target_version).await
+}
+
+/// Shared lock builder: derive the lock key at `target_version`, stage it as the
+/// in-flight `rotating_to_version` marker, and return the `OpCode::Lock`.
+async fn lock_command_for_target(
+    api: &Api,
+    sn: &DpaInterface,
+    machine_id: HostMachineId,
+    pci_name: &str,
+    target_version: i32,
+) -> CarbideResult<DpaCommand<'static>> {
     let ikm_version = u32::try_from(target_version).map_err(|e| CarbideError::Internal {
         message: format!(
             "lockdown IKM lock version {target_version} is negative for DPA {pci_name}: {e}"
@@ -442,8 +521,7 @@ async fn build_lock_command(
     // -- never the (possibly advanced) site-wide target re-read at observation
     // time. Staging first means we only ever issue a lock for a version we have
     // already recorded our intent to use; if the write fails we surface the error
-    // and do not lock. The writer is idempotent across the per-cycle
-    // re-derivation while Locking.
+    // and do not lock.
     let mut conn = api.database_connection.acquire().await.map_err(|e| {
         CarbideError::GenericErrorFromReport(eyre!(
             "failed to acquire connection to stage lockdown IKM rotation for DPA {pci_name}: {e}"
@@ -496,13 +574,16 @@ async fn process_mlx_observation(
         )));
     };
 
-    let dpa_search_config = DpaSearchConfig {
-        only_svpc: true,
-        only_astra: false,
-    };
-
-    let dpa_snapshots =
-        db::dpa_interface::find_by_machine_id(&mut txn, machine_id, dpa_search_config).await?;
+    // The row locks cover both the read and every dependent write. Each later
+    // observation also merges into this request's accumulated state, not the
+    // snapshot from before its preceding observations were applied.
+    let mut dpa_snapshots = db::dpa_interface::find_svpc_by_machine_id_for_update(
+        &mut txn,
+        machine_id.try_into().map_err(|error| {
+            CarbideError::InvalidArgument(format!("invalid host machine ID: {error}"))
+        })?,
+    )
+    .await?;
 
     if dpa_snapshots.is_empty() {
         tracing::error!(
@@ -527,25 +608,52 @@ async fn process_mlx_observation(
         )));
     }
 
+    let mut firmware_attention_changes = Vec::new();
     for obs in rep.observations {
-        let Some(devinfo) = obs.device_info else {
-            tracing::error!(
-                %machine_id,
-                "MLX device observation contains no device info",
-            );
-            continue;
-        };
-
-        let mut dpa = match get_dpa_by_mac(&devinfo, &dpa_snapshots) {
-            Ok(dpa) => dpa,
-            Err(e) => {
-                tracing::error!(
-                    pci_name = %devinfo.pci_name,
-                    mac_address = %devinfo.base_mac,
-                    error = %e,
-                    "DPA interface not found",
+        // The operation ID identifies a card without a device query during a
+        // burn. A stale receipt may still accompany useful device observations.
+        let operation_index = obs.firmware_operation.as_ref().and_then(|operation| {
+            dpa_snapshots
+                .iter()
+                .position(|dpa| dpa.firmware_operation_id() == operation.operation_id)
+        });
+        let dpa = if let Some(index) = operation_index {
+            let dpa = &mut dpa_snapshots[index];
+            // An operation can identify the card without a device query, but
+            // supplied device info must agree before we merge lock/profile data.
+            if let Some(devinfo) = obs.device_info.as_ref()
+                && devinfo.base_mac.parse::<MacAddress>().ok() != Some(dpa.mac_address)
+            {
+                tracing::warn!(
+                    %machine_id,
+                    dpa_interface_id = %dpa.id,
+                    expected_mac_address = %dpa.mac_address,
+                    reported_mac_address = %devinfo.base_mac,
+                    "ignoring MLX observation with conflicting card identities",
                 );
                 continue;
+            }
+            dpa
+        } else {
+            let Some(devinfo) = obs.device_info else {
+                tracing::warn!(
+                    %machine_id,
+                    operation_id = ?obs.firmware_operation.as_ref().map(|operation| &operation.operation_id),
+                    "MLX device observation has neither device info nor a matching firmware attempt",
+                );
+                continue;
+            };
+            match get_dpa_by_mac(&devinfo, &mut dpa_snapshots) {
+                Ok(dpa) => dpa,
+                Err(e) => {
+                    tracing::error!(
+                        pci_name = %devinfo.pci_name,
+                        mac_address = %devinfo.base_mac,
+                        error = %e,
+                        "DPA interface not found",
+                    );
+                    continue;
+                }
             }
         };
 
@@ -560,29 +668,33 @@ async fn process_mlx_observation(
             continue;
         }
 
-        // Use the latest CardState we pulled from the database. If there
-        // isn't one, then initialize an empty one, for which we will now
-        // update with whatever the current observation is.
-        let mut cstate = dpa.card_state.unwrap_or(CardState {
-            lockmode: None,
-            profile: None,
-            profile_synced: None,
-            firmware_report: None,
-        });
+        let lock_status = match obs.lock_status.map(DpaLockMode::try_from).transpose() {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(%error, "Failed to convert DPA lock status");
+                continue;
+            }
+        };
 
-        if let Some(lock_status) = obs.lock_status {
-            let ls = match DpaLockMode::try_from(lock_status) {
-                Ok(ls) => ls,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "Failed to convert DPA lock status",
-                    );
-                    continue;
-                }
-            };
+        let expected_operation_id = dpa.firmware_operation_id();
+        let is_applying_firmware =
+            dpa.controller_state.value == DpaInterfaceControllerState::ApplyFirmware;
+        let cstate = dpa.card_state.get_or_insert_default();
 
-            cstate.lockmode = Some(ls);
+        // A new ApplyFirmware entry cannot inherit an earlier attempt's success.
+        // Later card states retain the completed report for diagnostics.
+        if is_applying_firmware
+            && cstate
+                .firmware_operation
+                .as_ref()
+                .is_some_and(|operation| operation.operation_id != expected_operation_id)
+        {
+            cstate.firmware_operation = None;
+            cstate.firmware_report = None;
+        }
+
+        if let Some(lock_status) = lock_status {
+            cstate.lockmode = Some(lock_status);
         }
 
         if obs.profile_name.is_some() {
@@ -593,27 +705,79 @@ async fn process_mlx_observation(
             cstate.profile_synced = obs.profile_synced;
         }
 
-        // If the observation contains a FirmwareFlashReport update
-        // in it, then merge it into the latest CardState that we
-        // pulled from the database.
-        if let Some(firmware_report) = obs.firmware_report {
-            cstate.firmware_report = Some(firmware_report.into());
-        }
-
-        dpa.card_state = Some(cstate);
-
-        match dpa_interface::update_card_state(&mut txn, dpa).await {
-            Ok(_id) => (),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Failed to update DPA card state",
-                );
+        if let Some(operation) = obs.firmware_operation {
+            match FirmwareOperation::try_from(operation) {
+                Ok(operation)
+                    if is_applying_firmware && operation.operation_id == expected_operation_id =>
+                {
+                    let needs_attention = matches!(
+                        operation.state,
+                        FirmwareOperationState::Failed
+                            | FirmwareOperationState::Interrupted
+                            | FirmwareOperationState::ManualIntervention
+                            | FirmwareOperationState::Canceled
+                    ) || (operation.state
+                        == FirmwareOperationState::Complete
+                        && !operation.is_complete());
+                    let unchanged = cstate.firmware_operation.as_ref().is_some_and(|previous| {
+                        previous.operation_id == operation.operation_id
+                            && previous.state == operation.state
+                            && previous.phase == operation.phase
+                            && previous.is_complete() == operation.is_complete()
+                    });
+                    if needs_attention && !unchanged {
+                        firmware_attention_changes.push((dpa.id, operation.clone()));
+                    }
+                    // Older Core readers advance on `flashed` and `reset` alone,
+                    // so a burn cannot imply completion before verification.
+                    // Legacy `flashed` also covers completed no-work requests;
+                    // the nested receipt keeps the actual burn result.
+                    let mut legacy_report = operation.report.clone();
+                    legacy_report.flashed = operation.is_complete();
+                    cstate.firmware_report = Some(legacy_report);
+                    cstate.firmware_operation = Some(operation);
+                }
+                Ok(operation) => tracing::warn!(
+                    dpa_interface_id = %dpa.id,
+                    operation_id = %operation.operation_id,
+                    %expected_operation_id,
+                    "ignoring firmware result from another controller-state entry"
+                ),
+                Err(error) => tracing::warn!(
+                    dpa_interface_id = %dpa.id,
+                    %error,
+                    "ignoring invalid firmware receipt while retaining other observations"
+                ),
+            }
+        } else if cstate.firmware_operation.is_none() {
+            // Legacy reports remain useful until a correlated receipt exists.
+            // They cannot replace its phase evidence or complete ApplyFirmware.
+            if let Some(firmware_report) = obs.firmware_report {
+                cstate.firmware_report = Some(firmware_report.into());
             }
         }
+
+        // A failed statement aborts this transaction; do not acknowledge a
+        // batch whose receipts were not committed.
+        dpa_interface::update_card_state(&mut txn, dpa.clone()).await?;
     }
 
     txn.commit().await?;
+
+    // Report committed transitions, not every poll of the same stopped attempt
+    // or a batch rolled back after a later observation failed to persist.
+    for (dpa_interface_id, operation) in firmware_attention_changes {
+        let operation_phase = operation.phase.map(|phase| format!("{phase:?}"));
+        tracing::warn!(
+            %machine_id,
+            %dpa_interface_id,
+            operation_id = %operation.operation_id,
+            operation_state = ?operation.state,
+            operation_phase = operation_phase.as_deref(),
+            operation_diagnostic = operation.diagnostic.as_deref(),
+            "NIC firmware operation requires operator attention",
+        );
+    }
 
     Ok(())
 }
@@ -624,12 +788,31 @@ pub(crate) async fn publish_mlx_device_report(
     request: Request<mlx_device_pb::PublishMlxDeviceReportRequest>,
 ) -> Result<Response<mlx_device_pb::PublishMlxDeviceReportResponse>, Status> {
     log_request_data(&request);
+    let authenticated_machine_id = crate::auth::authenticated_machine_id(&request)?;
     let req = request.into_inner();
+
+    // Generic observations do not depend on SVPC. Legacy admin/simulator
+    // callers can still publish DPA data, but cannot replace host observations.
+    // A failed snapshot statement must not skip independent DPA writes.
+    // Return that error after processing the DPA report; reject invalid input now.
+    let observation_result = if let (Some(machine_id), Some(report)) =
+        (authenticated_machine_id, req.report.as_ref())
+    {
+        match super::mlx_device_report::persist(&api.database_connection, machine_id, report).await
+        {
+            Ok(()) => Ok(()),
+            Err(error @ CarbideError::DBError(_)) => Err(error),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        Ok(())
+    };
 
     if !api.runtime_config.is_ewethers_enabled() || !api.runtime_config.is_svpc_enabled() {
         tracing::info!(
             "DPA is not enabled or SVPC is not enabled, skipping SVPC publish_mlx_device_report"
         );
+        observation_result?;
         return Ok(Response::new(
             mlx_device_pb::PublishMlxDeviceReportResponse {},
         ));
@@ -673,7 +856,9 @@ pub(crate) async fn publish_mlx_device_report(
                 let device_description = device_info.device_description.clone();
 
                 let Some(new_interface) = NewDpaInterface::from_device_info(
-                    machine_id,
+                    machine_id.try_into().map_err(|error| {
+                        CarbideError::InvalidArgument(format!("invalid host machine ID: {error}"))
+                    })?,
                     device_info.base_mac,
                     device_type,
                     pci_name.clone(),
@@ -772,6 +957,7 @@ pub(crate) async fn publish_mlx_device_report(
         tracing::warn!("no embedded MlxDeviceReport published");
     }
 
+    observation_result?;
     Ok(Response::new(
         mlx_device_pb::PublishMlxDeviceReportResponse {},
     ))
@@ -784,6 +970,22 @@ pub(crate) async fn publish_mlx_observation_report(
     request: Request<mlx_device_pb::PublishMlxObservationReportRequest>,
 ) -> Result<Response<mlx_device_pb::PublishMlxObservationReportResponse>, Status> {
     log_request_data(&request);
+
+    if request.get_ref().report.as_ref().is_some_and(|report| {
+        report
+            .observations
+            .iter()
+            .any(|observation| observation.firmware_update_result.is_some())
+    }) {
+        // Generic NIC results belong to machine-owned operation storage, not
+        // DPA card state. Reject the entire batch before either the disabled-DPA
+        // no-op or DPA writes can acknowledge a result that was not persisted.
+        // https://github.com/dsx-ai-factory/infra-controller/issues/6677
+        return Err(CarbideError::FailedPrecondition(
+            "NIC firmware update result ingestion is not enabled".into(),
+        )
+        .into());
+    }
 
     if !api.runtime_config.is_ewethers_enabled() || !api.runtime_config.is_svpc_enabled() {
         tracing::info!(
@@ -804,10 +1006,12 @@ pub(crate) async fn publish_mlx_observation_report(
 /// Find the DPA object in the given slice of DPA objects which matches the MAC
 /// address in the device info. Linear search is fine because the slice is
 /// expected to contain fewer than a dozen entries.
-fn get_dpa_by_mac(devinfo: &MlxDeviceInfo, dpas: &[DpaInterface]) -> CarbideResult<DpaInterface> {
-    dpas.iter()
+fn get_dpa_by_mac<'a>(
+    devinfo: &MlxDeviceInfo,
+    dpas: &'a mut [DpaInterface],
+) -> CarbideResult<&'a mut DpaInterface> {
+    dpas.iter_mut()
         .find(|dpa| dpa.mac_address.to_string() == devinfo.base_mac)
-        .cloned()
         .ok_or_else(|| CarbideError::NotFoundError {
             kind: "mac_addr",
             id: devinfo.base_mac.to_string(),

@@ -78,11 +78,13 @@ async fn init(pool: PgPool) -> ZeroDpuEnv {
             },
             test_harness.test_meter.meter(),
             endpoint_exploration_service,
+            endpoint_explorer.clone(),
             api.common_pools().clone(),
             api.work_lock_manager_handle(),
             api.runtime_config.rack_profiles.clone(),
             None,
             api.credential_manager().clone(),
+            false,
         ),
         endpoint_explorer,
     );
@@ -801,7 +803,7 @@ async fn test_exploration_refresh_adds_declared_adapter_port_to_predicted_host(
                 serial_number: mock_host.serial.clone(),
                 dpu_policy: HostDpuPolicy::Ignore,
                 interfaces: vec![ExpectedInterface {
-                    mac_address: declared_port_mac,
+                    mac_address: Some(declared_port_mac),
                     role: ExpectedInterfaceRole::Host,
                     primary: Some(true),
                     ..Default::default()

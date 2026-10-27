@@ -14,20 +14,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use carbide_rpc_utils::dhcp::InterfaceInfo;
+use carbide_rpc_utils::dhcp::{HostConfig, InterfaceInfo, InterfaceInfoV6, ServiceReservation};
 use carbide_uuid::machine::MachineInterfaceId;
 use lru::LruCache;
-use rpc::forge::{DhcpDiscovery, DhcpRecord};
+use rpc::forge::{DhcpDiscovery, DhcpRecord, MessageKind};
 use tonic::async_trait;
 
-use super::DhcpMode;
+use super::{DhcpMode, V6Outcome, v6_message_kind};
+use crate::Config;
 use crate::cache::CacheEntry;
 use crate::errors::DhcpError;
 use crate::packet_handler::DecodedPacket;
-use crate::{Config, HostConfig};
 
 #[derive(Debug)]
-pub(crate) struct Dpu {}
+pub struct Dpu {}
 
 fn from_host_conf(
     value: &InterfaceInfo,
@@ -62,8 +62,68 @@ fn from_host_conf(
     })
 }
 
+/// Build the family-neutral API record consumed by the DHCPv6 encoder.
+fn from_host_conf_v6(
+    value: &InterfaceInfo,
+    ipv6: &InterfaceInfoV6,
+    interface_id: MachineInterfaceId,
+) -> Result<DhcpRecord, DhcpError> {
+    let mtu = value
+        .mtu
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| DhcpError::InvalidInput("DHCPv6 MTU exceeds the API range".to_string()))?
+        .unwrap_or_default();
+
+    Ok(DhcpRecord {
+        machine_id: None,
+        machine_interface_id: Some(interface_id),
+        segment_id: None,
+        subdomain_id: None,
+        fqdn: value.fqdn.clone(),
+        mac_address: String::new(),
+        address: ipv6
+            .address
+            .map_or_else(String::new, |address| address.to_string()),
+        mtu,
+        prefix: ipv6.prefix.clone(),
+        gateway: None,
+        booturl: value.booturl.clone(),
+        last_invalidation_time: None,
+        ntp_servers: vec![],
+    })
+}
+
 #[async_trait]
 impl DhcpMode for Dpu {
+    /// Resolves a reservation by receiving interface and MAC, rejecting unmatched clients on
+    /// configured service interfaces to prevent host DHCP fallback.
+    fn service_reservation<'a>(
+        &self,
+        config: &'a Config,
+        receiving_interface: &str,
+        client_mac: &str,
+    ) -> Result<Option<&'a ServiceReservation>, DhcpError> {
+        let service_config = config.service_config();
+        // Only explicitly configured service interfaces suppress normal host discovery.
+        if !service_config.has_interface(receiving_interface) {
+            return Ok(None);
+        }
+
+        let client_mac = client_mac.parse().map_err(|error| {
+            DhcpError::InvalidInput(format!("invalid service client MAC {client_mac}: {error}"))
+        })?;
+        // A configured service interface fails closed when chaddr has no exact reservation.
+        service_config
+            .get(receiving_interface, &client_mac)
+            .map(Some)
+            .ok_or_else(|| {
+                DhcpError::MissingArgument(format!(
+                    "no service reservation for MAC {client_mac} on {receiving_interface}"
+                ))
+            })
+    }
+
     async fn discover_dhcp(
         &self,
         discovery_request: DhcpDiscovery,
@@ -95,6 +155,54 @@ impl DhcpMode for Dpu {
         from_host_conf(ip_details, host_config.host_interface_id)
     }
 
+    /// Resolve DHCPv6 directly from the interface block delivered in host.yaml.
+    async fn discover_dhcp_v6(
+        &self,
+        discovery_request: DhcpDiscovery,
+        config: &Config,
+        _machine_cache: &mut std::sync::Arc<tokio::sync::Mutex<LruCache<String, CacheEntry>>>,
+    ) -> Result<V6Outcome, DhcpError> {
+        let message_kind = v6_message_kind(&discovery_request)?;
+        let Some(circuit_id) = discovery_request.circuit_id else {
+            return Err(DhcpError::MissingArgument("DHCPv6 circuit id".to_string()));
+        };
+
+        // DPU mode selects the precomputed host entry by the receiving interface,
+        // matching its DHCPv4 path.
+        let host_config = config
+            .host_config
+            .as_ref()
+            .ok_or_else(|| DhcpError::InvalidInput("host input is invalid".to_string()))?;
+        let interface = host_config
+            .host_ip_addresses
+            .get(&circuit_id)
+            .ok_or_else(|| {
+                DhcpError::MissingArgument(format!("could not find IP details for {circuit_id}"))
+            })?;
+        let Some(ipv6) = interface.ipv6.as_ref() else {
+            // No IPv6 block means this interface is v6-disabled. This is
+            // distinct from a SLAAC-only block whose address is absent.
+            return Err(DhcpError::NoIpv6Configuration(circuit_id));
+        };
+
+        let record = || from_host_conf_v6(interface, ipv6, host_config.host_interface_id);
+
+        match message_kind {
+            // Stateless requests receive configuration regardless of whether
+            // the interface also owns a stateful address.
+            MessageKind::V6InfoRequest => Ok(V6Outcome::OptionsOnly(record()?)),
+            MessageKind::V6Solicit | MessageKind::V6Request if ipv6.address.is_some() => {
+                Ok(V6Outcome::Stateful(record()?))
+            }
+            // A present prefix with no address is the explicit SLAAC-only
+            // contract. The encoder retains the wire type to choose the RFC status.
+            MessageKind::V6Solicit | MessageKind::V6Request => Ok(V6Outcome::NoAddress),
+            _ => Err(DhcpError::InvalidInput(
+                "non-DHCPv6 message kind passed to DHCPv6 mode".to_string(),
+            )),
+        }
+    }
+
     /// Here circuit is interface name. This is what dhcp-relay used to fill.
     fn get_circuit_id(&self, _packet: &DecodedPacket, circuit_id: &str) -> Option<String> {
         Some(circuit_id.to_string())
@@ -123,7 +231,7 @@ fn validate_host_config(host_config: &HostConfig) -> Result<(), DhcpError> {
 
 /// This config is fetched by dpu-agent from controller periodically. In case of any change in
 /// this configuration, dpu-agent MUST restart dhcp-server.
-pub(crate) async fn get_host_config(
+pub async fn get_host_config(
     host_config_path: Option<String>,
 ) -> Result<Option<HostConfig>, DhcpError> {
     let Some(host_config) = host_config_path else {
@@ -143,11 +251,29 @@ pub(crate) async fn get_host_config(
 mod tests {
     use std::net::Ipv4Addr;
 
-    use carbide_rpc_utils::dhcp::InterfaceInfoV6;
+    use carbide_rpc_utils::dhcp::{
+        InterfaceInfoV6, ServiceConfig, ServiceInterfaceReservations, ServiceLink, ServiceLinkV4,
+    };
     use carbide_test_support::Outcome::*;
     use carbide_test_support::scenarios;
 
     use super::*;
+
+    /// Builds one valid service reservation so lookup tests exercise interface and MAC selection
+    /// rather than validation.
+    fn service_reservation() -> ServiceReservation {
+        ServiceReservation {
+            attachment_id: "11111111-1111-1111-1111-111111111111".parse().unwrap(),
+            interface_ordinal: 0,
+            internal_uuid: "22222222-2222-2222-2222-222222222222".parse().unwrap(),
+            mac_address: "02:00:00:00:00:01".parse().unwrap(),
+            link: ServiceLink::Ipv4(ServiceLinkV4 {
+                address: "192.0.2.11".parse().unwrap(),
+                prefix: "192.0.2.10/31".parse().unwrap(),
+                gateway: "192.0.2.10".parse().unwrap(),
+            }),
+        }
+    }
 
     fn summarize_ipv4_config(
         interface: InterfaceInfo,
@@ -172,6 +298,55 @@ mod tests {
         );
         let interface = serde_yaml::from_str(&yaml).map_err(drop)?;
         validate_interface_presence(interface)
+    }
+
+    /// Verifies DPU service lookup requires both the receiving slot and chaddr while an unreserved
+    /// interface still permits host fallback.
+    #[test]
+    fn service_lookup_reserves_configured_interfaces() {
+        // Configure one populated service interface and one explicit empty slot, leaving an unrelated interface outside service ownership.
+        let reservation = service_reservation();
+        let service_config = ServiceConfig::try_new(vec![
+            ServiceInterfaceReservations {
+                receiving_interface: "pf0sf1".to_string(),
+                reservations: vec![reservation.clone()],
+            },
+            ServiceInterfaceReservations {
+                receiving_interface: "pf0sf2".to_string(),
+                reservations: vec![],
+            },
+        ])
+        .unwrap();
+        let config = Config::new(
+            Default::default(),
+            None,
+            67,
+            rpc::forge_tls_client::ForgeClientConfig::new(String::new(), None),
+        )
+        .with_service_config(service_config);
+        let mode = Dpu {};
+
+        // The exact pair resolves without consulting host configuration.
+        assert_eq!(
+            mode.service_reservation(&config, "pf0sf1", "02:00:00:00:00:01")
+                .unwrap(),
+            Some(&reservation)
+        );
+
+        // Unknown clients and explicit empty service slots fail closed, while unrelated interfaces remain eligible for host lookup.
+        assert!(
+            mode.service_reservation(&config, "pf0sf1", "02:00:00:00:00:02")
+                .is_err()
+        );
+        assert!(
+            mode.service_reservation(&config, "pf0sf2", "02:00:00:00:00:01")
+                .is_err()
+        );
+        assert_eq!(
+            mode.service_reservation(&config, "host0", "02:00:00:00:00:01")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

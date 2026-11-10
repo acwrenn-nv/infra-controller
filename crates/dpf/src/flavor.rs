@@ -343,10 +343,15 @@ fn render_bf4_pf_preflight(topology: &DpfInterceptBridging) -> String {
     let mut script = String::from(concat!(
         "sys_class_net=${NICO_SYS_CLASS_NET:-/sys/class/net}\n",
         "resolve_dpf_pf() {\n",
-        "    local semantic_name=$1 result_variable=$2 phys_port_name netdev\n",
+        "    local semantic_name=$1 result_variable=$2 phys_port_name netdev pci_device\n",
         "    local -a matches=()\n",
         "    for phys_port_name in \"$sys_class_net\"/*/phys_port_name; do\n",
         "        [[ -r \"$phys_port_name\" ]] || continue\n",
+        // Representor identities are local to an adapter. CX9 exposes the same cNpfM
+        // names as BF4, so require the BF4 N/S PCI identity before counting matches.
+        "        pci_device=${phys_port_name%/phys_port_name}/device\n",
+        "        [[ -r \"$pci_device/vendor\" && -r \"$pci_device/device\" ]] || continue\n",
+        "        [[ \"$(<\"$pci_device/vendor\")\" == 0x15b3 && \"$(<\"$pci_device/device\")\" == 0xa2df ]] || continue\n",
         "        if [[ \"$(<\"$phys_port_name\")\" == \"$semantic_name\" ]]; then\n",
         "            netdev=$(basename \"${phys_port_name%/phys_port_name}\")\n",
         "            matches+=(\"$netdev\")\n",
@@ -717,6 +722,7 @@ pub fn flavor_bf4_astra(
         extra_bfcfg_parameters,
         enable_delay_host_init,
         true,
+        None,
     )
 }
 
@@ -736,16 +742,18 @@ pub(crate) fn flavor_bf4_astra_with_topology(
     extra_bfcfg_parameters: &[String],
     enable_delay_host_init: bool,
     partial_multiplane_enabled: bool,
+    weave_underlay: Option<&serde_json::Value>,
 ) -> Result<DPUFlavorTemplate, crate::error::DpfError> {
     reject_template_delimiters(extra_bfcfg_parameters)?;
+    let mut config_files =
+        get_bf4_astra_config_files(proxy, dhcp_acl_interfaces, partial_multiplane_enabled)?;
+    if let Some(underlay) = weave_underlay {
+        config_files.push(weave_underlay_config_file(underlay)?);
+    }
     let flavor_spec = DpuFlavorSpec {
         bfcfg_parameters: (!extra_bfcfg_parameters.is_empty())
             .then(|| extra_bfcfg_parameters.to_vec()),
-        config_files: Some(get_bf4_astra_config_files(
-            proxy,
-            dhcp_acl_interfaces,
-            partial_multiplane_enabled,
-        )?),
+        config_files: Some(config_files),
         containerd_config: Some(DpuFlavorContainerdConfig {
             registry_endpoint: None,
             sandbox_image: None,
@@ -786,6 +794,56 @@ pub(crate) fn flavor_bf4_astra_with_topology(
         spec: flavor_spec,
     };
     flavor_template_from_flavor(&flavor)
+}
+
+/// Keep site-wide Weave settings but render PCI identities from this DPU's validated placement.
+fn weave_underlay_config_file(
+    underlay: &serde_json::Value,
+) -> Result<DpuFlavorConfigFiles, crate::error::DpfError> {
+    // Parse JSON text as YAML to preserve scalar numbers even when serde_json's
+    // arbitrary_precision feature is enabled by the production API dependency graph.
+    let mut settings: serde_yaml::Value =
+        serde_yaml::from_str(&underlay.to_string()).map_err(|error| {
+            crate::error::DpfError::ConfigError(format!("invalid Weave underlay: {error}"))
+        })?;
+    let interfaces = settings
+        .as_mapping_mut()
+        .and_then(|settings| settings.remove(serde_yaml::Value::String("interfaces".to_string())))
+        .ok_or_else(|| {
+            crate::error::DpfError::ConfigError("Weave underlay interfaces are missing".to_string())
+        })?;
+    let mut raw = serde_yaml::to_string(&settings).map_err(|error| {
+        crate::error::DpfError::ConfigError(format!("failed to serialize Weave underlay: {error}"))
+    })?;
+    raw.push_str("interfaces:\n");
+    raw.push_str(indoc::indoc! {r#"
+        {{ if index . "astra_hardware_placement" }}{{ range .astra_hardware_placement }}{{ if not .hw_plane }}  - pciAddress: "{{ .pci_address }}"
+            underlayInterface: "brcx-{{ .group_id }}"
+            overlayDHCPInterface: "{{ .group_id }}"
+            dhcpBridgeName: "br-dhcp-{{ .group_id }}"
+            dropBridgeName: "br-drop-{{ .group_id }}"
+        {{ end }}{{ end }}{{ else }}"#});
+    for line in serde_yaml::to_string(&interfaces)
+        .map_err(|error| {
+            crate::error::DpfError::ConfigError(format!(
+                "failed to serialize Weave interfaces: {error}"
+            ))
+        })?
+        .lines()
+    {
+        raw.push_str("  ");
+        raw.push_str(line);
+        raw.push('\n');
+    }
+    raw.push_str("{{ end }}\n");
+    Ok(DpuFlavorConfigFiles {
+        path: crate::types::WEAVE_UNDERLAY_CONFIG_PATH.to_string(),
+        operation: Some(DpuFlavorConfigFilesOperation::Override),
+        permissions: Some("0644".to_string()),
+        raw: Some(raw),
+        content_from: None,
+        r#type: None,
+    })
 }
 
 /// Default grub kernel parameters for the BF4 flavor.
@@ -1686,9 +1744,43 @@ fn dhcp_acl_rules(interfaces: Option<&[DpuServiceInterfaceTemplateDefinition]>) 
     rules
 }
 
-// Fixed interface mappings for VR200
+/// Adds optional per-device placement to the shared template; DPF owns concrete flavor creation.
+/// Resolve every declared port before either script can change the network.
+fn astra_placement_script_raw() -> &'static str {
+    indoc::indoc! {r#"
+        {{ if index . "astra_hardware_placement" }}#!/bin/bash
+        SYSFS_PCI_DEVICES_DIR="${SYSFS_PCI_DEVICES_DIR:-/sys/bus/pci/devices}"
+        declare -A ASTRA_NETDEV=() ASTRA_GROUP=()
+        while IFS='|' read -r group plane pci phys logical; do
+            result=""
+            for path in "$SYSFS_PCI_DEVICES_DIR/$pci/net/"*; do
+                [ -r "$path/phys_port_name" ] || continue
+                IFS= read -r actual < "$path/phys_port_name"
+                [ "$actual" = "$phys" ] || continue
+                if [ -n "$result" ]; then
+                    echo "Astra placement: multiple netdevs for $pci / $phys" >&2
+                    exit 1
+                fi
+                result="${path##*/}"
+            done
+            if [ -z "$result" ]; then
+                echo "Astra placement: no netdev for $pci / $phys" >&2
+                exit 1
+            fi
+            ASTRA_NETDEV["$group|$plane"]="$result"
+            ASTRA_GROUP["$logical"]="$group"
+        done <<'ASTRA_PORTS'
+        {{ range .astra_hardware_placement }}{{ .group_id }}|{{ .hw_plane }}|{{ .pci_address }}|{{ .phys_port_name }}|{{ .logical_ifname }}
+        {{ end }}ASTRA_PORTS
+        {{ end }}"#}
+}
+
 fn interface_fixed_mapping_raw() -> String {
     concat!(
+        "{{ if index . \"astra_hardware_placement\" }}",
+        "pci_address,phys_port_name,cerebro_interface_name\n",
+        "{{ range .astra_hardware_placement }}{{ .pci_address }},{{ .phys_port_name }},{{ .cerebro_ifname }}\n{{ end }}",
+        "{{ else }}",
         "pci_address,phys_port_name,cerebro_interface_name\n",
         "0005:03:00.0,p0,C1-1-L1\n",
         "0005:03:00.1,p1,C1-1-L2\n",
@@ -1722,6 +1814,7 @@ fn interface_fixed_mapping_raw() -> String {
         "0000:06:00.1,p1,C7-2-L2\n",
         "0000:06:00.2,p2,C7-2-L3\n",
         "0000:06:00.3,p3,C7-2-L4\n",
+        "{{ end }}\n",
     )
     .to_string()
 }
@@ -1729,6 +1822,7 @@ fn interface_fixed_mapping_raw() -> String {
 fn ovs_script_raw() -> String {
     // Keep YAML block indentation and place the selected script's shebang on this line.
     [
+        astra_placement_script_raw(),
         "{{ if and .dpu_device_underlay_rows (index .dpu_device_underlay_rows 0).cerebro_ifname }}",
         ovs_cerebro_script_raw(),
         "{{ else }}",
@@ -1802,12 +1896,13 @@ fn ovs_cerebro_script_raw() -> &'static str {
           for sw_plane in "${SW_PLANES[@]}"; do
             logical_ifname="eth_r${rail}_p$((4 * sw_plane))"
             netdev_name="${NETDEV_BY_INTERFACES[$logical_ifname]:-}"
-            if [[ ! "$netdev_name" =~ ^(.+)p[0-9]+$ ]]; then
+            {{ if index . "astra_hardware_placement" }}bridge="brcx-${ASTRA_GROUP[$logical_ifname]}"
+        {{ else }}if [[ ! "$netdev_name" =~ ^(.+)p[0-9]+$ ]]; then
               echo "ovs-script.sh: netdev $netdev_name for $logical_ifname has no p<port> suffix" >&2
               return 1
             fi
             bridge="brcx-${BASH_REMATCH[1]}"
-            _ovs-vsctl --may-exist add-br "$bridge"
+        {{ end }}    _ovs-vsctl --may-exist add-br "$bridge"
             _ovs-vsctl set bridge "$bridge" datapath_type=netdev
             _ovs-vsctl set bridge "$bridge" fail_mode=standalone
             _ovs-vsctl set Interface "$bridge" mtu_request=9216
@@ -1824,7 +1919,7 @@ fn ovs_cerebro_script_raw() -> &'static str {
               _ovs-vsctl set Interface "$netdev_name" mtu_request=9216
               _ovs-vsctl set Interface "$netdev_name" external_ids:xplane=true
               # Set the group id to match the downlink patch's physical NIC group ID, e.g. A56p2 -> A56.
-              _ovs-vsctl set Interface "$netdev_name" external_ids:xplane-group-id="${netdev_name%p[0-9]}"
+              _ovs-vsctl set Interface "$netdev_name" external_ids:xplane-group-id="{{ if index . "astra_hardware_placement" }}${ASTRA_GROUP[$logical_ifname]}{{ else }}${netdev_name%p[0-9]}{{ end }}"
               _ovs-vsctl set Interface "$netdev_name" external_ids:xplane-uplink=true
               _ovs-vsctl set Interface "$netdev_name" external_ids:xplane-plane-id="$hw_plane"
             done
@@ -1933,7 +2028,8 @@ fn ovs_legacy_script_raw() -> &'static str {
         # Each row is:
         # interface prefix | PCI address | bridge | xplane group ID
         XPLANE_ROWS=(
-            "A56|0005:06:00.0|brcx-A56|A56"
+        {{ if index . "astra_hardware_placement" }}{{ range .astra_hardware_placement }}{{ if not .hw_plane }}    "{{ .group_id }}|{{ .pci_address }}|brcx-{{ .group_id }}|{{ .group_id }}"
+        {{ end }}{{ end }}{{ else }}    "A56|0005:06:00.0|brcx-A56|A56"
             "A43|0004:03:00.0|brcx-A43|A43"
             "A53|0005:03:00.0|brcx-A53|A53"
             "A46|0004:06:00.0|brcx-A46|A46"
@@ -1941,7 +2037,7 @@ fn ovs_legacy_script_raw() -> &'static str {
             "A13|0001:03:00.0|brcx-A13|A13"
             "A3|0000:03:00.0|brcx-A3|A3"
             "A16|0001:06:00.0|brcx-A16|A16"
-        )
+        {{ end }})
         HW_PLANES=(0 1 2 3)
 
         for row in "${XPLANE_ROWS[@]}"; do
@@ -1951,7 +2047,7 @@ fn ovs_legacy_script_raw() -> &'static str {
             _ovs-vsctl set bridge "$bridge" datapath_type=netdev
             _ovs-vsctl set bridge "$bridge" fail_mode=standalone
             for hw_plane in "${HW_PLANES[@]}"; do
-                interface_val="${iface_prefix}p${hw_plane}"
+                {{ if index . "astra_hardware_placement" }}interface_val="${ASTRA_NETDEV["$iface_prefix|$hw_plane"]}"{{ else }}interface_val="${iface_prefix}p${hw_plane}"{{ end }}
 
                 _ovs-vsctl --may-exist add-port br-xplane "$interface_val"
                 _ovs-vsctl set Interface "$interface_val" type=dpdk
@@ -1970,6 +2066,7 @@ fn ovs_legacy_script_raw() -> &'static str {
 fn configure_xplane_network_script_raw() -> String {
     // Go whitespace trimming here would remove the YAML block scalar's required newline.
     [
+        astra_placement_script_raw(),
         "{{ if and .dpu_device_underlay_rows (index .dpu_device_underlay_rows 0).cerebro_ifname }}",
         xplane_network_preamble_script_raw(),
         &xplane_cerebro_network_script_raw(),
@@ -1993,7 +2090,8 @@ fn xplane_legacy_network_script_raw() -> String {
         # interface prefix | PCI address | bridge. The MAC-to-PCI association is read
         # from the SmartNIC PF config for each interface prefix's p0 port.
         PCI_BRIDGE_ROWS=(
-            "A53|0005:03:00.0|brcx-A53"
+        {{ if index . "astra_hardware_placement" }}{{ range .astra_hardware_placement }}{{ if not .hw_plane }}    "{{ .group_id }}|{{ .pci_address }}|brcx-{{ .group_id }}"
+        {{ end }}{{ end }}{{ else }}    "A53|0005:03:00.0|brcx-A53"
             "A56|0005:06:00.0|brcx-A56"
             "A43|0004:03:00.0|brcx-A43"
             "A46|0004:06:00.0|brcx-A46"
@@ -2001,7 +2099,7 @@ fn xplane_legacy_network_script_raw() -> String {
             "A6|0000:06:00.0|brcx-A6"
             "A13|0001:03:00.0|brcx-A13"
             "A16|0001:06:00.0|brcx-A16"
-        )
+        {{ end }})
 
         # MAC address | address | gateway | /16 route | /13 route
         DPU_DEVICE_UNDERLAY_ROWS=(
@@ -2017,8 +2115,8 @@ fn xplane_legacy_network_script_raw() -> String {
             for row in "${PCI_BRIDGE_ROWS[@]}"; do
                 IFS='|' read -r iface_prefix pci bridge <<< "$row"
                 bridge="brcx-${iface_prefix}"
-                iface_val="${iface_prefix}p0"
-                config_path="/sys/bus/pci/devices/${pci}/net/${iface_val}/smart_nic/pf/config"
+                {{ if index . "astra_hardware_placement" }}iface_val="${ASTRA_NETDEV["$iface_prefix|0"]}"{{ else }}iface_val="${iface_prefix}p0"{{ end }}
+                config_path="{{ if index . "astra_hardware_placement" }}${SYSFS_PCI_DEVICES_DIR}{{ else }}/sys/bus/pci/devices{{ end }}/${pci}/net/${iface_val}/smart_nic/pf/config"
                 if [ -r "$config_path" ] && grep -qiF "$target_mac" "$config_path"; then
                     printf '%s\n' "$bridge"
                     return 0
@@ -2281,9 +2379,10 @@ fn xplane_check_net_config_and_build_bridge_by_cerebro_script_raw() -> &'static 
                         interface_name="eth_r${rail}_p$((4 * sw_plane + port))"
                         if [ "${CEREBRO_BY_INTERFACE[$interface_name]:-}" = "$cerebro_name" ]; then
                             netdev_name="${NETDEV_BY_INTERFACES[$interface_name]:-}"
-                            [[ "$netdev_name" =~ ^(.+)p[0-9]+$ ]] || return 1
+                            {{ if index . "astra_hardware_placement" }}printf 'brcx-%s\n' "${ASTRA_GROUP[$interface_name]}"
+        {{ else }}[[ "$netdev_name" =~ ^(.+)p[0-9]+$ ]] || return 1
                             printf 'brcx-%s\n' "${BASH_REMATCH[1]}"
-                            return 0
+        {{ end }}                    return 0
                         fi
                     done
                 done
@@ -2527,7 +2626,7 @@ fn xplane_cerebro_network_script_raw() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Output};
@@ -2565,9 +2664,53 @@ mod tests {
         flavor_spec_from_template(&template)
     }
 
-    fn flavor_spec_from_template(template: &DPUFlavorTemplate) -> DpuFlavorSpec {
+    pub(crate) fn flavor_spec_from_template(template: &DPUFlavorTemplate) -> DpuFlavorSpec {
         let body: serde_yaml::Value = serde_yaml::from_str(&template.spec.template).unwrap();
-        serde_yaml::from_value(body["spec"].clone()).unwrap()
+        let mut spec: DpuFlavorSpec = serde_yaml::from_value(body["spec"].clone()).unwrap();
+        default_placement_files(&mut spec);
+        spec
+    }
+
+    // Strip only placement branches; retain other Go directives for the existing script tests.
+    fn default_placement(source: &str) -> String {
+        let mut raw = source.to_string();
+        while let Some(start) = raw.find("{{ if index . \"astra_hardware_placement\" }}") {
+            let mut depth = 0;
+            let mut fallback = None;
+            let mut offset = start;
+            loop {
+                let open = offset + raw[offset..].find("{{").unwrap();
+                let end = open + raw[open..].find("}}").unwrap() + 2;
+                let action = raw[open + 2..end - 2].trim();
+                match action.split_whitespace().next().unwrap() {
+                    "if" | "range" => depth += 1,
+                    "else" if depth == 1 => fallback = Some(end),
+                    "end" => depth -= 1,
+                    _ => (),
+                }
+                if depth == 0 {
+                    let default = fallback
+                        .map(|from| raw[from..open].to_string())
+                        .unwrap_or_default();
+                    raw.replace_range(start..end, &default);
+                    break;
+                }
+                offset = end;
+            }
+        }
+        raw
+    }
+
+    fn default_placement_files(spec: &mut DpuFlavorSpec) {
+        for file in spec.config_files.iter_mut().flatten() {
+            file.raw = file.raw.as_deref().map(default_placement);
+            if file.path == "/etc/mellanox/interface-fixed-mapping.csv" {
+                file.raw = file
+                    .raw
+                    .as_deref()
+                    .map(|raw| format!("{}\n", raw.trim_end()));
+            }
+        }
     }
 
     /// The `raw` body of the trailing (proxy) config file built by `default_flavor`.
@@ -2627,7 +2770,9 @@ mod tests {
         // Materialize only the semantic sysfs surface consumed by provisioning.
         for (netdev, phys_port_name) in phys_port_names {
             let netdev_dir = fixture.join(netdev);
-            fs::create_dir_all(&netdev_dir).expect("synthetic netdev directory must be created");
+            fs::create_dir_all(netdev_dir.join("device")).unwrap();
+            fs::write(netdev_dir.join("device/vendor"), "0x15b3\n").unwrap();
+            fs::write(netdev_dir.join("device/device"), "0xa2df\n").unwrap();
             fs::write(netdev_dir.join("phys_port_name"), phys_port_name)
                 .expect("synthetic phys_port_name must be written");
         }
@@ -2651,7 +2796,9 @@ mod tests {
         ));
         // Map the semantic PF to a different runtime name so command checks prove resolution.
         let netdev = fixture.join("sys-class-net/en8f2");
-        fs::create_dir_all(&netdev).expect("synthetic Astra netdev directory must be created");
+        fs::create_dir_all(netdev.join("device")).unwrap();
+        fs::write(netdev.join("device/vendor"), "0x15b3\n").unwrap();
+        fs::write(netdev.join("device/device"), "0xa2df\n").unwrap();
         fs::write(netdev.join("phys_port_name"), "c2pf3")
             .expect("synthetic Astra phys_port_name must be written");
 
@@ -2790,9 +2937,304 @@ export -f run_stage ovs-vsctl
         (output, stages)
     }
 
-    /// Verifies the topology-backed Astra bootstrap orders prerequisites before dependent setup and
-    /// preserves strict versus best-effort failures, so required failures stop later stages without
-    /// making a tolerated representor attachment block completion.
+    fn render_template(source: &str, values: &serde_json::Value) -> String {
+        fn value(json: &serde_json::Value) -> gtmpl::Value {
+            match json {
+                serde_json::Value::Null => gtmpl::Value::Nil,
+                serde_json::Value::Bool(b) => (*b).into(),
+                serde_json::Value::Number(n) => n.as_u64().unwrap().into(),
+                serde_json::Value::String(s) => s.clone().into(),
+                serde_json::Value::Array(a) => a.iter().map(value).collect::<Vec<_>>().into(),
+                serde_json::Value::Object(o) => o
+                    .iter()
+                    .map(|(k, v)| (k.clone(), value(v)))
+                    .collect::<std::collections::HashMap<_, _>>()
+                    .into(),
+            }
+        }
+        let mut template = gtmpl::Template::default();
+        // These fixtures use empty server names; existing script tests cover hostname escaping.
+        template.add_func("js", |_| {
+            unreachable!("render fixtures have empty server_name")
+        });
+        template.parse(source).unwrap();
+        template
+            .render(&gtmpl::Context::from(value(values)))
+            .unwrap()
+    }
+
+    pub(crate) fn render_astra_files(
+        source: &str,
+        values: &serde_json::Value,
+    ) -> std::collections::HashMap<String, String> {
+        let body: serde_yaml::Value =
+            serde_yaml::from_str(&render_template(source, values)).unwrap();
+        serde_yaml::from_value::<DpuFlavorSpec>(body["spec"].clone())
+            .unwrap()
+            .config_files
+            .unwrap()
+            .into_iter()
+            .filter_map(|file| file.raw.map(|raw| (file.path, raw)))
+            .collect()
+    }
+
+    #[test]
+    fn weave_underlay_uses_per_dpu_placement_and_preserves_defaults() {
+        use crate::astra_placement::{ports_for_dpu, test_machine};
+        let interfaces = [
+            ("0005:06:00.0", "A56"),
+            ("0005:03:00.0", "A53"),
+            ("0000:06:00.0", "A6"),
+            ("0000:03:00.0", "A3"),
+            ("0004:03:00.0", "A43"),
+            ("0004:06:00.0", "A46"),
+            ("0001:03:00.0", "A13"),
+            ("0001:06:00.0", "A16"),
+        ]
+        .into_iter()
+        .map(|(pci_address, group)| {
+            serde_json::json!({
+                "pciAddress": pci_address,
+                "underlayInterface": format!("brcx-{group}"),
+                "overlayDHCPInterface": group,
+                "dhcpBridgeName": format!("br-dhcp-{group}"),
+                "dropBridgeName": format!("br-drop-{group}"),
+            })
+        })
+        .collect::<Vec<_>>();
+        let defaults = serde_json::json!({
+            "nicIDType": "mac", "overlayNetworkPrefixLength": 11,
+            "softwarePlaneIDBitLength": 8, "railIDBitLength": 4,
+            "interfaces": interfaces,
+        });
+        let template = flavor_bf4_astra_with_topology(
+            "test",
+            &None,
+            64,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            Some(&defaults),
+        )
+        .unwrap();
+        let values = serde_json::json!({"server_name": "", "dpu_device_underlay_rows": [{"cerebro_ifname": "", "ip": ""}]});
+        let files = render_astra_files(&template.spec.template, &values);
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&files[crate::types::WEAVE_UNDERLAY_CONFIG_PATH]).unwrap();
+        assert_eq!(yaml["overlayNetworkPrefixLength"].as_u64(), Some(11));
+        assert_eq!(yaml["softwarePlaneIDBitLength"].as_u64(), Some(8));
+        assert_eq!(yaml["railIDBitLength"].as_u64(), Some(4));
+        let rendered: serde_json::Value =
+            serde_yaml::from_str(&files[crate::types::WEAVE_UNDERLAY_CONFIG_PATH]).unwrap();
+        assert_eq!(rendered, defaults);
+        for (serial, offset) in [("dpu-one", 3), ("dpu-two", 20)] {
+            let machine = test_machine(serial, offset);
+            let placement = ports_for_dpu(&machine, serial).unwrap().unwrap();
+            let values = serde_json::json!({"server_name": "", "dpu_device_underlay_rows": [{"cerebro_ifname": "", "ip": ""}], "astra_hardware_placement": placement});
+            let files = render_astra_files(&template.spec.template, &values);
+            let mut rendered: serde_json::Value =
+                serde_yaml::from_str(&files[crate::types::WEAVE_UNDERLAY_CONFIG_PATH]).unwrap();
+            let interfaces = rendered
+                .as_object_mut()
+                .unwrap()
+                .remove("interfaces")
+                .unwrap();
+            let expected = placement
+                .iter()
+                .filter(|port| port.hw_plane == 0)
+                .map(|port| {
+                    serde_json::json!({
+                        "pciAddress": port.pci_address,
+                        "underlayInterface": format!("brcx-{}", port.group_id),
+                        "overlayDHCPInterface": port.group_id,
+                        "dhcpBridgeName": format!("br-dhcp-{}", port.group_id),
+                        "dropBridgeName": format!("br-drop-{}", port.group_id),
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(expected.len(), 8);
+            assert_eq!(interfaces, serde_json::json!(expected));
+            let mut expected_settings = defaults.clone();
+            expected_settings
+                .as_object_mut()
+                .unwrap()
+                .remove("interfaces");
+            assert_eq!(rendered, expected_settings);
+        }
+    }
+
+    #[test]
+    fn optional_placement_preserves_rendered_default_spec() {
+        let template = flavor_bf4_astra("test", &None, 64, &[], false).unwrap();
+        let default = flavor_spec_from_template(&template);
+        let baseline = flavor_template_from_flavor(&DPUFlavor {
+            metadata: Default::default(),
+            spec: default,
+        })
+        .unwrap();
+        let machine = crate::astra_placement::test_machine("test-dpu", 3);
+        let rows = machine.data.interfaces.iter().map(|nic| serde_json::json!({
+            "cerebro_ifname": nic.physical_ifname, "logical_ifname": nic.logical_ifname,
+            "mac_address": "", "ip": "", "gateway": "", "rail_route": "", "sw_plane_route": "",
+        })).collect::<Vec<_>>();
+        for values in [
+            serde_json::json!({"server_name": "", "dpu_device_underlay_rows": [{"cerebro_ifname": "", "ip": ""}]}),
+            serde_json::json!({"server_name": "", "dpu_device_underlay_rows": rows}),
+        ] {
+            let rendered = render_template(&template.spec.template, &values);
+            let original = render_template(&baseline.spec.template, &values);
+            assert_eq!(
+                serde_yaml::from_str::<serde_yaml::Value>(&rendered).unwrap(),
+                serde_yaml::from_str::<serde_yaml::Value>(&original).unwrap(),
+                "omitted placement must preserve every default flavor field in both rendering branches"
+            );
+        }
+    }
+
+    #[test]
+    fn astra_placement_scripts_resolve_remapped_sysfs_and_preserve_group_identity() {
+        use crate::astra_placement::{ports_for_dpu, test_machine};
+        let machine = test_machine("dpu-one", 3);
+        let placement = ports_for_dpu(&machine, "dpu-one").unwrap().unwrap();
+        let base = flavor_bf4_astra("test", &None, 64, &[], false).unwrap();
+        let rows = placement.iter().map(|p| serde_json::json!({
+            "cerebro_ifname": p.cerebro_ifname, "mac_address": "", "ip": "", "gateway": "", "rail_route": "", "sw_plane_route": "", "logical_ifname": p.logical_ifname,
+        })).collect::<Vec<_>>();
+        let values = serde_json::json!({ "astra_hardware_placement": placement, "dpu_device_underlay_rows": rows, "server_name": "" });
+        let files = render_astra_files(&base.spec.template, &values);
+        let raw = |path: &str| files[path].as_str();
+        let csv = raw("/etc/mellanox/interface-fixed-mapping.csv");
+        assert_eq!(csv.lines().count(), 33);
+        assert!(csv.lines().skip(1).all(|line| line.starts_with("0000:")));
+        let temp =
+            std::env::temp_dir().join(format!("carbide-astra-placement-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        for (index, port) in placement.iter().enumerate() {
+            let net = temp
+                .join(&port.pci_address)
+                .join("net")
+                .join(format!("labnic{index}"));
+            std::fs::create_dir_all(&net).unwrap();
+            std::fs::write(
+                net.join("phys_port_name"),
+                format!("{}\n", port.phys_port_name),
+            )
+            .unwrap();
+        }
+        let ovs = raw("/etc/mellanox/ovs-script.sh");
+        let mut legacy_values = values.clone();
+        legacy_values["dpu_device_underlay_rows"] =
+            serde_json::json!([{"cerebro_ifname": "", "ip": ""}]);
+        let legacy_files = render_astra_files(&base.spec.template, &legacy_values);
+        let legacy = &legacy_files["/etc/mellanox/ovs-script.sh"];
+        let stubs = "_ovs-vsctl() { printf '%s\\n' \"$*\"; }; ovs-vsctl() { :; }; ovs-appctl() { :; }; systemctl() { return 1; }; mst() { :; }; export -f _ovs-vsctl ovs-vsctl ovs-appctl systemctl mst; ";
+        let run = || {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("{stubs}\n{legacy}"))
+                .env("SYSFS_PCI_DEVICES_DIR", &temp)
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("add-port br-xplane labnic0"));
+        assert!(stdout.contains("external_ids:xplane-group-id=A13"));
+        assert!(!stdout.contains("add-port br-xplane A13p0"));
+        for (index, port) in placement.iter().enumerate() {
+            assert!(stdout.contains(&format!(
+                "set Interface labnic{index} external_ids:xplane-group-id={}",
+                port.group_id
+            )));
+            assert!(stdout.contains(&format!(
+                "set Interface labnic{index} external_ids:xplane-plane-id={}",
+                port.hw_plane
+            )));
+        }
+        let network = raw("/usr/local/sbin/configure-xplane-network.sh");
+        assert!(network.contains("${ASTRA_GROUP[$interface_name]}"));
+        // Exercise the selected Cerebro branch as DPF would render it, against all 32 remapped ports.
+        let ovs_file = temp.join("ovs.sh");
+        fs::write(&ovs_file, ovs).unwrap();
+        let mapping_file = temp.join("mapping.csv");
+        fs::write(&mapping_file, csv).unwrap();
+        let mut network_values = values;
+        network_values["dpu_device_underlay_rows"][0]["ip"] = serde_json::json!("100.96.0.0/31");
+        network_values["dpu_device_underlay_rows"][0]["gateway"] = serde_json::json!("100.96.0.1");
+        network_values["dpu_device_underlay_rows"][0]["rail_route"] =
+            serde_json::json!("100.96.0.0/16");
+        network_values["dpu_device_underlay_rows"][0]["sw_plane_route"] =
+            serde_json::json!("100.96.0.0/13");
+        let network_files = render_astra_files(&base.spec.template, &network_values);
+        let rendered_network = &network_files["/usr/local/sbin/configure-xplane-network.sh"];
+        let ip_stub = indoc::indoc! {r#"
+            ip() {
+                if [ "$1" = -o ]; then
+                    local dev="${@: -1}"
+                    [[ "$dev" != eth_* ]] || return 1
+                    printf '1: %s: mtu 9216\n' "$dev"
+                elif [ "$1" != link ]; then
+                    printf 'inet 192.0.2.1/24\n'
+                fi
+            }
+            systemctl() { :; }
+            netplan() { :; }
+            xargs() { cat >/dev/null; }
+        "#};
+        let run_network = || {
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!("{stubs}\n{ip_stub}\n{rendered_network}"))
+                .env("SYSFS_PCI_DEVICES_DIR", &temp)
+                .env("MAPPING_FILE", &mapping_file)
+                .env("OVS_CONFIG_SCRIPT", &ovs_file)
+                .env("LLDP_FILE", temp.join("lldp.conf"))
+                .env("NETPLAN_FILE", temp.join("netplan.yaml"))
+                .env("NETDEV_MAPPING_FILE", temp.join("netdev-map"))
+                .output()
+                .unwrap()
+        };
+        let network_output = run_network();
+        assert!(
+            network_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&network_output.stderr)
+        );
+        let netplan = fs::read_to_string(temp.join("netplan.yaml")).unwrap();
+        assert!(netplan.contains("brcx-A13:"));
+        assert!(netplan.contains("100.96.0.0/31"));
+        assert!(
+            fs::read_to_string(temp.join("netdev-map"))
+                .unwrap()
+                .contains("eth_r2_p0\tlabnic0")
+        );
+        let missing = temp
+            .join(&placement[0].pci_address)
+            .join("net/labnic0/phys_port_name");
+        std::fs::remove_file(missing).unwrap();
+        let failed = run();
+        assert!(!failed.status.success());
+        assert!(
+            failed.stdout.is_empty(),
+            "lookup failure must precede OVS mutations"
+        );
+        let network_failed = run_network();
+        assert!(!network_failed.status.success());
+        assert!(!String::from_utf8_lossy(&network_failed.stdout).contains("add-port"));
+        assert_eq!(
+            fs::read_to_string(temp.join("netplan.yaml")).unwrap(),
+            netplan
+        );
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
     #[test]
     fn astra_topology_bootstrap_order_and_failure_boundaries() {
         // The successful execution proves hooks surround fixed OVS, telemetry, xplane, and topology.
@@ -3170,7 +3612,10 @@ done
                         systemctl() { builtin printf 'systemctl\n' >> "$TEST_CALLS"; }
                         netplan() { builtin printf 'netplan\n' >> "$TEST_CALLS"; }
                     "#};
-            let script = format!("{preamble}{stubs}{}", xplane_cerebro_network_script_raw());
+            let script = format!(
+                "{preamble}{stubs}{}",
+                default_placement(&xplane_cerebro_network_script_raw())
+            );
             let output = Command::new("bash")
                 .arg("-c")
                 .arg(script)
@@ -3472,7 +3917,7 @@ done
         let netplan = fixture.join("99-cx9-rails.yaml");
         fs::write(&netplan, "original configuration\n").unwrap();
         let applied = fixture.join("applied");
-        let legacy = xplane_legacy_network_script_raw();
+        let legacy = default_placement(&xplane_legacy_network_script_raw());
         let mut script = legacy[legacy.find("NETPLAN_FILE=").unwrap()..]
             .replace(
                 "NETPLAN_FILE=\"/etc/netplan/99-cx9-rails.yaml\"",
@@ -3601,6 +4046,32 @@ done
         assert!(script.contains("host_representor=\"${dpf_c2p3_netdev}vf4\""));
         assert!(script.contains("external_ids='{}' || true"));
         assert!(!script.contains("phys_port_name 'c2pf3vf4'"));
+    }
+
+    /// Identical CX9 representor identities must not make the BF4 selection ambiguous.
+    #[test]
+    fn bf4_intercept_bridging_preflight_excludes_other_adapters() {
+        let topology = intercept_bridging();
+        let mut ports = vec![("bf4", "c2pf3")];
+        let cx_names: Vec<_> = (0..8).map(|i| format!("cx{i}")).collect();
+        ports.extend(cx_names.iter().map(|name| (name.as_str(), "c2pf3")));
+        ports.push(("other_vendor", "c2pf3"));
+        ports.push(("missing_identity", "c2pf3"));
+        let prefix = r#"
+            for i in {0..7}; do
+                printf '0x1025\n' > "$NICO_SYS_CLASS_NET/cx$i/device/device"
+            done
+            printf '0x8086\n' > "$NICO_SYS_CLASS_NET/other_vendor/device/vendor"
+            rm "$NICO_SYS_CLASS_NET/missing_identity/device/vendor"
+        "#;
+        let output = run_bf4_preflight(
+            &topology,
+            &ports,
+            prefix,
+            "printf '%s' \"$dpf_c2p3_netdev\"",
+        );
+        assert!(output.status.success(), "preflight failed: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "bf4");
     }
 
     /// Verifies generic-BF4 preflight fails before OVS mutation for missing or ambiguous PFs.
@@ -4665,7 +5136,7 @@ done
 
             "Astra network setup enables xplane and Weave metrics" {
                 {
-                    [ovs_script.as_str(), ovs_cerebro_script_raw()].into_iter().all(|script| {
+                    [ovs_script.as_str(), &default_placement(ovs_cerebro_script_raw())].into_iter().all(|script| {
                         script.contains("'other_config:flow-metric-labels=\"to_plane,from_plane,device_name,group,plane\"'")
                             && script.contains("other_config:doca-telemetry-interval=\"1000\"")
                             && script.contains("other_config:doca-telemetry-ipc=\"true\"")
@@ -4814,7 +5285,7 @@ done
         value_scenarios!(
             run = |(p, enabled)| {
                 let template = flavor_bf4_astra_with_topology(
-                    "astra-ns", &p, 128, None, None, &[], true, enabled,
+                    "astra-ns", &p, 128, None, None, &[], true, enabled, None,
                 ).unwrap();
                 let spec = flavor_spec_from_template(&template);
                 assert_eq!(

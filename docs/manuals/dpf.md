@@ -917,6 +917,130 @@ Per-deployment field reference:
 | `extra_services` | no | none | Optional deployment-local field overrides for extra services. Only extras supported by this deployment type are used. |
 | `enable_delay_host_init` | no | `false` | When enabled, delay host initialization until the DPU's `DPUServiceCriticalPodsReady` condition is true. |
 
+##### BF4 host representor selection
+
+For BF4 generic and Astra deployments with typed intercept bridging, set each
+entry's `dpf_interface` to the controller/PF/VF identity reported by the BF4's
+`phys_port_name`. For example, `c1pf0` requires
+`dpf_interface = { controller_id = 1, pf_id = 0 }`; a VF entry on that parent
+also includes its `vf_id`. This is a site setting, not a global controller default.
+
+The generated preflight matches only netdevs owned by NVIDIA BlueField-4 PCI
+devices (vendor `0x15b3`, device `0xa2df`). CX9 representors can report the same
+`c1pf0` identity and are excluded. Missing PCI identity, no BF4 match, or multiple
+BF4 matches fail before OVS changes. Linux interface names and PCI bus numbers
+are not hardcoded, and BF3 selection is unchanged.
+
+##### Per-machine Astra hardware placement
+
+Each CX9 `host_nics` entry in expected-machine registration can declare
+`astra_placement`: a PCI address in the selected DPU's namespace, not the host's.
+Create, update, replace, read, and field-mask patch paths retain this object.
+
+For example, this is **one interface entry**, not a complete registration:
+
+```json
+{
+  "nic_type": "CX9",
+  "physical_ifname": "C1-1-L1",
+  "logical_ifname": "eth_r0_p0",
+  "astra_placement": {
+    "dpu_serial_number": "EXAMPLE-DPU-1",
+    "group_id": "A53",
+    "hw_plane": 0,
+    "pci_address": "0000:03:00.0",
+    "phys_port_name": "p0"
+  }
+}
+```
+
+For every DPU serial with explicit placement, declare all eight groups with four
+hardware planes each: 32 entries. `hw_plane` is zero through three. Group-to-logical
+interface relationships remain fixed:
+
+| Group | Logical interfaces |
+| --- | --- |
+| `A53` | `eth_r0_p0` through `eth_r0_p3` |
+| `A56` | `eth_r0_p4` through `eth_r0_p7` |
+| `A43` | `eth_r1_p0` through `eth_r1_p3` |
+| `A46` | `eth_r1_p4` through `eth_r1_p7` |
+| `A13` | `eth_r2_p0` through `eth_r2_p3` |
+| `A16` | `eth_r2_p4` through `eth_r2_p7` |
+| `A3` | `eth_r3_p0` through `eth_r3_p3` |
+| `A6` | `eth_r3_p4` through `eth_r3_p7` |
+
+The PCI address must use lowercase `dddd:bb:dd.f`, with device at most `1f` and
+function at most `7`. Both domain zero and nonzero domains are accepted.
+`phys_port_name` must match the port's actual sysfs readback and contain 1–127
+ASCII letters, digits, underscores, or hyphens. DPU serials contain 1–64 ASCII
+letters, digits, underscores, or hyphens. PCI addresses, group/plane pairs,
+physical interface identifiers, and logical interface names must be unique
+within each DPU. They may repeat on another DPU. A DPU with explicit placement
+uses only its 32 placed declarations; other DPUs retain the unplaced CX9 entries.
+Partial mappings, empty objects, unsafe names, and contradictory logical rail
+identities are rejected.
+
+NICo sets `DPUDevice.spec.values.astra_hardware_placement`. The shared
+`DPUFlavorTemplate` renders the CSV, OVS ports, and underlay lookup; DPF creates
+and selects each device's flavor. Existing deployment selection, ServiceInterfaces,
+and Cerebro underlay branch selection still apply. BDF and `phys_port_name`
+resolve netdevs independently of Linux interface names.
+
+Every Weave-enabled Astra flavor installs its underlay configuration at
+`/etc/openvswitch/nico-weave-underlay.yaml`. The Weave service selects that stable
+path through its `UNDERLAY_CONFIG_FILE` environment variable. The path is the
+same whether placement is omitted or supplied:
+
+- With placement omitted, the file retains the original hardcoded PCI addresses
+  and interface definitions from the deployment's shared underlay configuration.
+- With placement supplied, the file replaces those interface definitions with
+  the selected DPU's eight hardware-plane-zero PCI addresses and group names.
+  Site-wide settings, including overlay prefix length and rail/software-plane
+  bit lengths, remain shared.
+
+The official Weave chart exposes the DPU's `/etc/openvswitch` directory to the
+container. Its original `/var/lib/dpf/weave/flow-controller/underlay-config.yaml`
+comes from a read-only ConfigMap mount; installing a host file at that original
+path would not replace the container's ConfigMap contents. NICo retains the
+ConfigMap configuration for staged upgrades.
+
+The shared template body and hash change to add placement support and the
+underlay file. The `OnDelete` strategy requires the supported reprovisioning
+lifecycle to install changed templates or values; restarting the API alone does
+not install the file on existing DPUs. Service configuration updates and DPU
+reprovisioning must be sequenced explicitly.
+
+For a fresh deployment, use the generated service settings. For an existing
+Astra deployment whose DPUs lack the new file:
+
+1. Before upgrading NICo, retain the original ConfigMap path with this
+   deployment-local override (replace `bf4_astra` with the deployment's name):
+
+   ```toml
+   [dpf.deployments.bf4_astra.extra_services.doca_weave_flow_controller.extra_helm_values.weaveFlowController.containers.weaveFlowController]
+   env = [{ name = "UNDERLAY_CONFIG_FILE", value = "/var/lib/dpf/weave/flow-controller/underlay-config.yaml" }]
+   ```
+
+   The `env` array replaces the generated array. Include any other environment
+   entries the deployment needs.
+2. Upgrade NICo, then reprovision the deployment's DPUs through the supported
+   lifecycle to install the flavor-provided file. Verify that each DPU has
+   `/etc/openvswitch/nico-weave-underlay.yaml` before switching the service path.
+3. Remove the temporary `UNDERLAY_CONFIG_FILE` override so the generated service
+   settings select the new file. Preserve other operator-defined environment
+   entries, if any, and include the generated file path when retaining an
+   explicit `env` array.
+
+Do not ingest DPUs that require explicit placement while the service still
+selects the legacy ConfigMap: it contains the shared default PCI mapping. Enable
+those placements after the deployment has switched to the per-DPU file. This
+sequence does not eliminate the disruption inherent in DPU reprovisioning.
+
+Declare all 32 ports before ingestion. Replacing `host_nics` replaces placement;
+a field-mask patch that omits `host_nics` preserves it. Registration rejects
+changing or removing placement on an existing `DPUDevice`: decommission and
+re-ingest to apply the change.
+
 ##### Service VPC and additional SF capacity
 
 Two global `[dpu_config]` fields reserve SFs for BF3 and generic BF4:
